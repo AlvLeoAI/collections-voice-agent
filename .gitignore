@@ -1,0 +1,20 @@
+# Agent guide (local only)
+AGENTS.md
+
+# Environment variables
+.env
+
+# Virtual environments
+.venv/
+.venv_runtime/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data (calls, jobs, attempts, temp audio)
+runtime/
+
+# Saved TTS recordings
+recordings/

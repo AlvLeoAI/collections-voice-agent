@@ -1,0 +1,12 @@
+{
+  "name": "silence_callback",
+  "timezone": "America/Chicago",
+  "language": "en-US",
+  "start_local_datetime": "2026-02-04T10:00:00",
+  "events": [
+    { "event_type": "silence" },
+    { "event_type": "silence" },
+    { "event_type": "user_utterance", "transcript": "Yes, tomorrow." },
+    { "event_type": "user_utterance", "transcript": "Yes." }
+  ]
+}

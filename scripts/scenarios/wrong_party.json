@@ -1,0 +1,10 @@
+{
+  "name": "wrong_party",
+  "timezone": "America/Chicago",
+  "language": "en-US",
+  "start_local_datetime": "2026-02-04T10:00:00",
+  "events": [
+    { "event_type": "user_utterance", "transcript": "You have the wrong number. Alex doesn't live here." }
+  ]
+}
+

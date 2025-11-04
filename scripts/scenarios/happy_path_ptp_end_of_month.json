@@ -1,0 +1,16 @@
+{
+  "name": "happy_path_ptp_end_of_month",
+  "timezone": "America/Chicago",
+  "language": "en-US",
+  "start_local_datetime": "2026-02-04T10:00:00",
+  "events": [
+    { "event_type": "user_utterance", "transcript": "This is Alex Morgan." },
+    { "event_type": "user_utterance", "transcript": "78701." },
+    { "event_type": "user_utterance", "transcript": "Alex Morgan." },
+    { "event_type": "user_utterance", "transcript": "Yes." },
+    { "event_type": "user_utterance", "transcript": "Not today." },
+    { "event_type": "user_utterance", "transcript": "End of month." },
+    { "event_type": "user_utterance", "transcript": "Yes." }
+  ]
+}
+

@@ -1,0 +1,15 @@
+{
+  "name": "date_too_late_reconduct",
+  "timezone": "America/Chicago",
+  "language": "en-US",
+  "start_local_datetime": "2026-02-04T10:00:00",
+  "events": [
+    { "event_type": "user_utterance", "transcript": "This is Alex Morgan." },
+    { "event_type": "user_utterance", "transcript": "78701." },
+    { "event_type": "user_utterance", "transcript": "Alex Morgan." },
+    { "event_type": "user_utterance", "transcript": "Not a good time, and I can pay next month." },
+    { "event_type": "user_utterance", "transcript": "On Friday." },
+    { "event_type": "user_utterance", "transcript": "Yes." }
+  ]
+}
+
