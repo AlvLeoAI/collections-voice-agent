@@ -1,141 +1,78 @@
-# System Design Document
-## Outbound Collections Voice Agent Demo
+# Design Decisions: Outbound Collections Voice Agent
 
-**Date:** February 2026
+## 1. Architecture: Single Agent, Phase-Based State Machine
 
-## 1. Executive Summary
+The system uses a **single deterministic agent** rather than multiple specialized agents or an LLM-driven approach. A single agent avoids inter-agent handoff complexity, eliminates serialization overhead between components, and keeps the entire call flow auditable in one code path. For a compliance-critical domain like debt collection, this traceability matters more than architectural elegance.
 
-This project is a deterministic outbound collections voice-agent demo. It models call flow with explicit state transitions and emits host actions for outcomes such as promise-to-pay, escalation, and call ending.
+The agent operates as a **phase-based state machine** with five phases: `pre_verification` → `verification` → `post_verification` (negotiation) → `closing/escalation` → `ended`. Each phase gates what the agent can say and do. Phase transitions are driven by **scored intent classification**: the `classify_utterance` function returns ranked intents with confidence scores, and the agent routes to the appropriate handler based on the current phase and top intent. For example, an `affirmation` intent during `pre_verification` transitions to `verification`, while the same intent during `post_verification` may confirm a promise-to-pay. Universal intents (`stop_request`, `goodbye`, `human_handoff`) are checked before phase routing and override any phase-specific logic.
 
-Key properties:
-- Compliance-first pre-verification behavior.
-- Deterministic state updates across turns.
-- Scenario replay support for repeatable demos.
-- API + frontend sandbox for interactive testing.
+If responsibilities were split across agents (e.g., a verifier agent and a negotiator agent), each would need its own state management, and handoff errors could leak sensitive data across phase boundaries. The single-agent design avoids this by construction.
 
-## 2. Architecture Overview
+## 2. Verification Sufficiency
 
-### 2.1 Core Components
+Right-party verification requires the caller to confirm their **5-digit ZIP code** against the value stored in `account_context.expected_zip`. This is a **hard code gate**, not a prompt instruction: the function `_deliver_disclosure_and_start_negotiation` is only reachable through the code path where `provided_zip == expected_zip` evaluates to `True` at `agent.py:210`. Until that condition passes, `right_party_verified` remains `False`, `phase` stays in `verification`, and no debt amount, creditor name, or account details appear in any response.
 
-- `src/outbound_voice_agent/state.py`
-  - Authoritative `CallState` dataclass and nested state objects.
-- `src/outbound_voice_agent/agent.py`
-  - Deterministic call logic via `start_call` and `handle_turn`.
-- `src/outbound_voice_agent/tools/date_normalizer.py`
-  - Date phrase normalization for negotiation flows.
-- `scripts/run_outbound_demo.py`
-  - Interactive and scenario replay CLI runner.
-- `src/api/server.py`
-  - FastAPI wrapper exposing `/call/start` and `/call/turn`.
-- `frontend/app.py`
-  - Streamlit sandbox consuming FastAPI endpoints.
+This matters because prompt-level instructions can be bypassed through adversarial input or model drift. A structural gate cannot. The agent allows up to 3 verification attempts (`verification_attempts` counter); on failure, the call ends with reason `verification_failed`.
 
-### 2.2 Runtime Flow
+## 3. Conversation vs External Logic
 
-1. Start call with `start_call` (pre-verification introduction).
-2. For each turn, send `TurnEvent` to `handle_turn`.
-3. Agent returns:
-   - `assistant_text`
-   - `assistant_intent`
-   - `actions[]`
-   - updated `call_state`
-4. Host system (or demo runner) decides how to execute actions.
+The boundary is simple: **conversation handles persuasion; tools handle validation and system actions.**
 
-## 3. State Machine
+- **Pure conversation** (no tools needed): greetings, empathy statements, objection handling, reconduction after refusal, silence recovery prompts. These are generated deterministically from the phase and intent.
+- **External tool — date normalization** (`date_normalizer.py`): when a debtor proposes a payment date using ambiguous language ("mañana", "el viernes", "a fin de mes"), the `normalize_datetime_local` tool parses it against the current local date and returns a structured result with `needs_confirmation` flag. If ambiguous, the agent confirms before acting. If the resolved date falls outside the current month, the agent rejects it conversationally and reconducts.
+- **External tools — call control and escalation** (`call_control.py`, `escalation.py`): system actions like `end_call`, `create_promise_to_pay`, `schedule_callback`, `escalate_to_human`, and `mark_do_not_contact` are emitted as action dictionaries in the response. The host system executes them. The agent never performs side effects directly.
 
-Primary phases:
-- `pre_verification`
-- `verification`
-- `post_verification`
-- `closing`
-- `escalation`
-- `ended`
+This separation means the agent's conversational logic can be tested without any external dependencies, while action execution is the host's responsibility.
 
-Key controls:
-- Turn limits (`max_total_turns`)
-- Silence counting and timeout
-- Verification attempts
-- Negotiation proposal caps
+## 4. Call Ending and Escalation Rules
 
-## 4. Compliance and Guardrails
+**A call ends when:**
+- The debtor confirms a promise-to-pay → `ptp_set`
+- The debtor says goodbye or requests to stop → `user_ended` / `cease_contact`
+- Wrong party is confirmed → `wrong_party`
+- 3 consecutive silences with no response → `silence_timeout`
+- Global turn limit reached (default 25) → `max_turns`
+- Verification fails after 3 attempts → `verification_failed`
+- The debtor says it's not a good time → `busy`
 
-- Pre-verification disclosure prohibition:
-  - No debt/company/account details before right-party verification.
-- Voice-first responses:
-  - Short responses, one question per turn.
-- Action payload discipline:
-  - Keep action data non-sensitive and minimal.
+**A call escalates to a human when:**
+- The debtor explicitly requests a human → `user_requested_human`
+- A dispute is raised → `dispute`
+- Repeated refusal after 2 negotiation attempts → `hard_refusal` / `multiple_refusals`
+- 2 consecutive low-confidence utterances the system cannot parse → `low_confidence`
 
-## 5. Integration Boundary
+Both ending and escalation set `phase = "ended"` and are **idempotent**: once ended, any subsequent `handle_turn` call returns `"already_closed"` with an empty actions list, preventing duplicate side effects.
 
-The agent is integration-ready but demo-scoped:
-- No telephony vendor integration.
-- Call control tools are stubs for host implementation.
-- Actions are contracts to be executed by an external orchestrator.
+## 5. Loop Prevention
 
-## 6. Known Gaps for Production
+The system uses **phase-specific counters** as hard limits:
+- `verification_attempts`: max 3 before call ends
+- `reconduction_attempts`: max 2 callback offers before closing
+- `negotiation_proposals_count`: max 2 before escalation
+- `silence_count`: max 3 consecutive before timeout
+- `clarification_attempts`: max 1 before escalation on low-confidence input
+- `max_total_turns` (default 25): global safety net across all phases
 
-- Real telephony adapter and media pipeline.
-- Durable persistence for call session state and outcomes.
-- Action executor for side effects (callback scheduling, escalation routing, outcome logging).
-- Full end-to-end monitoring and operational observability.
+Additionally, `last_assistant_question` is tracked in state to detect when the agent is about to repeat itself, and the prompt contracts instruct against asking the same question more than twice. Systematic repeated-question detection at the code level is a backlog item.
 
-## 7. Demo Validation
+## 6. State Preservation
 
-Use JSON scenarios under `scripts/scenarios/` to validate deterministic behavior and edge cases.
+All call state lives in a single `CallState` Pydantic model with `extra="forbid"` (no undeclared fields). It tracks: current phase, verification status, turn counters, negotiation progress (`promise_to_pay.date`, `promise_to_pay.amount`, `promise_to_pay.confirmed`), callback state, escalation flags and reasons, user sentiment, and the last assistant question/intent for context continuity.
 
-## 8. Outbound Orchestration Blueprint
+State is serialized as JSON per call in `runtime/calls/` via `call_store.py`. No raw PII is logged — the state contains only verification pass/fail flags, not the actual ZIP or identity data provided by the user.
 
-Recommended production-style trigger model:
-- `cron` creates campaign jobs (wave dialing / scheduled callbacks).
-- `webhook` creates event-driven jobs (new delinquency, broken PTP, inbound callback request).
-- Both feed a single queue that workers consume.
+## 7. AI Model Selection
 
-Why this pattern:
-- Centralized policy checks before dialing (timezone windows, retry caps, DNC, consent policies).
-- Reliable retries with backoff and dead-letter handling.
-- Strong idempotency guarantees to prevent duplicate calls.
-- Horizontal scaling with controlled worker concurrency.
+This bot uses a **fully deterministic approach with no LLM** for response generation. This is a deliberate production choice:
 
-Reference contract:
-- `src/api/outbound_orchestration.py`
-  - job schema (`OutboundCallJob`)
-  - trigger types (`TriggerSource`)
-  - state machine (`JobState`, `JobEvent`, `STATE_TRANSITIONS`)
-  - retry/backoff behavior
-- `src/api/job_store.py`
-  - durable JSON queue persistence (`runtime/jobs/*.json`)
-- `src/api/contact_attempt_store.py`
-  - per-account attempt/decision ledger (`runtime/attempts/*.json`)
-- `scripts/run_outbound_worker.py`
-  - queue consumer that initializes outbound call sessions (demo scope; no telephony dial)
+- **Zero latency variance**: voice calls require sub-200ms response decisions. Deterministic code runs in single-digit milliseconds, while LLM inference introduces 200-2000ms of unpredictable latency.
+- **100% instruction adherence**: in a regulated domain (FDCPA, TCPA compliance), the bot must never deviate from its script. Deterministic code cannot hallucinate a disclosure or skip a verification step.
+- **Zero hallucination risk**: the bot will never fabricate debt amounts, invent payment terms, or disclose information from the wrong account.
+- **No API costs or vendor dependency**: no per-call inference costs, no uptime dependency on external model providers.
+- **Fully testable and auditable**: every code path can be unit-tested with deterministic scenario replay.
 
-### 8.1 Job State Machine
+**Tradeoffs acknowledged**: the deterministic approach requires manual coverage of conversation scenarios and is less flexible with unexpected user phrasing. Intent classification uses keyword and pattern matching rather than semantic understanding, which may miss edge cases.
 
-States:
-- `queued` -> waiting for worker lease
-- `leased` -> worker reserved job for a short TTL
-- `running` -> active call execution
-- `waiting_retry` -> retry deferred until `next_attempt_at_utc`
-- terminal: `succeeded`, `dead_letter`, `canceled`
+**If an LLM were introduced**, the recommended approach would be a **small, fast model (8B parameter class, fine-tuned)** for intent classification only, keeping response generation deterministic. This would improve intent coverage without sacrificing response predictability. The model would need to run on dedicated inference infrastructure to meet voice latency SLAs.
 
-Allowed transitions (strict):
-- `queued --lease--> leased`
-- `leased --schedule_retry--> waiting_retry` (policy-gate defer before dial)
-- `leased --start--> running`
-- `running --call_succeeded--> succeeded`
-- `running --call_failed--> failed`
-- `failed --schedule_retry--> waiting_retry`
-- `waiting_retry --retry_ready--> queued`
-- `failed --exhaust_retries--> dead_letter`
-- `queued|leased|running|waiting_retry --cancel--> canceled`
-
-### 8.2 Compliance Gate Ordering
-
-Before worker starts an outbound attempt:
-1. Validate idempotency key has not already succeeded in the same campaign window.
-2. Validate suppression controls (`dnc`, `cease_contact`, `legal_hold`).
-3. Validate local-time call window and day-level attempt caps from attempt ledger.
-4. Enforce min-gap minutes between counted attempts.
-5. Start call session (`/call/start`) only after gate pass.
-6. Enforce pre-verification disclosure prohibition until right-party verification is complete.
+**For TTS output**, the system uses ElevenLabs `eleven_turbo_v2_5` with streaming playback via `mpv`, optimized for low-latency voice delivery. In production, a self-hosted TTS model would eliminate the vendor dependency.

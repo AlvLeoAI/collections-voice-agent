@@ -31,6 +31,60 @@ def normalize_datetime_local(
 ) -> NormalizedDateTimeResult:
     """
     Normalize Spanish and English date phrases for the collection bot.
+
+    Parses relative, ambiguous, and explicit date expressions from user speech
+    and returns a structured result with the resolved date, confidence score,
+    and a flag indicating whether the agent must confirm with the user before
+    acting.
+
+    Parameters:
+        text (str): Raw user transcript to parse (e.g., "mañana", "el viernes",
+            "February 20", "2026-02-15").
+        current_local_date (str): ISO-format date (YYYY-MM-DD) used as the
+            reference point for relative date calculations.
+        current_local_time (str): Current local time in HH:MM format, attached
+            to the result when a time component is relevant.
+        timezone (str): IANA timezone identifier (e.g.,
+            "America/Argentina/Buenos_Aires") for the result datetime.
+        language (str): Language hint for phrase matching. Defaults to "es-AR".
+            Both Spanish and English phrases are always attempted regardless of
+            this value.
+
+    Returns:
+        NormalizedDateTimeResult with the following fields:
+            ok (bool): True if a date was successfully parsed.
+            date (str | None): Resolved date in ISO format (YYYY-MM-DD), or
+                None on failure.
+            time (str | None): Time in HH:MM format, or None if not applicable.
+            datetime_local (str | None): Full ISO-8601 datetime with timezone,
+                or None if time is unavailable.
+            timezone (str): The IANA timezone passed in (echoed back).
+            confidence (float): Parsing confidence in [0.0, 1.0]. Values below
+                0.85 typically warrant user confirmation.
+            needs_confirmation (bool): True when the input was ambiguous (e.g.,
+                a weekday name without a specific date). The agent MUST confirm
+                with the user before accepting the date.
+            notes (str | None): Human-readable label describing how the date
+                was resolved (e.g., "tomorrow", "weekday: viernes",
+                "end of month").
+
+    Example:
+        >>> normalize_datetime_local(
+        ...     "el viernes",
+        ...     current_local_date="2026-02-09",
+        ...     current_local_time="14:30",
+        ...     timezone="America/Argentina/Buenos_Aires",
+        ... )
+        {
+            "ok": True,
+            "date": "2026-02-13",
+            "time": "14:30",
+            "datetime_local": "2026-02-13T14:30:00-03:00",
+            "timezone": "America/Argentina/Buenos_Aires",
+            "confidence": 0.8,
+            "needs_confirmation": True,
+            "notes": "weekday: viernes",
+        }
     """
     normalized_text = (text or "").strip().lower()
     try:
