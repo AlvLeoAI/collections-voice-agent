@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GEMINI_API_KEY: ""
+  GOOGLE_API_KEY: ""
+  ELEVENLABS_API_KEY: ""
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lint with ruff
+        run: uv run ruff check .
+
+      - name: Run offline pytest suite
+        run: uv run pytest -v
+
+      - name: Replay all deterministic CLI scenarios
+        run: |
+          for scenario in scripts/scenarios/*.json; do
+            echo "=== Replaying ${scenario} ==="
+            uv run python scripts/run_outbound_demo.py --scenario "${scenario}"
+          done
+
+      - name: Run in-process API smoke flows (temporary runtime)
+        run: |
+          uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario happy_path
+          uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario dispute
+          uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario wrong_party
+
+      - name: Run worker compliance smoke test
+        run: uv run python scripts/smoke_worker_compliance.py

@@ -1,26 +1,38 @@
-import streamlit as st
-import httpx
-import sys
 import hashlib
+import os
+import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+
+import httpx
+import streamlit as st
 from dotenv import load_dotenv
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.voice_handler import VoiceHandler
+from src.voice_handler import VoiceHandler  # noqa: E402
 
 load_dotenv()
 
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+
+_SUFFIX_TO_MIME = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mp3",
+    ".m4a": "audio/m4a",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+}
 
 st.set_page_config(page_title="Outbound Agent Sandbox", page_icon="🤖", layout="wide")
 
-# Initialize Voice Handler locally for audio playback
+# Initialize optional voice adapter (works cleanly with zero API keys).
 if "voice_handler" not in st.session_state:
     st.session_state.voice_handler = VoiceHandler()
 
@@ -120,6 +132,21 @@ with st.sidebar:
 
     if profile_inputs_disabled:
         st.caption("Profile is locked during an active call. Click Reset Call to switch ZIP/profile.")
+
+    st.title("🎙️ Voice Controls")
+    vh = st.session_state.voice_handler
+    st.toggle(
+        "Enable Voice TTS (ElevenLabs)",
+        value=False,
+        disabled=not vh.tts_enabled,
+        key="enable_tts",
+    )
+    if not vh.tts_enabled:
+        st.caption("TTS disabled: set ELEVENLABS_API_KEY to enable browser playback.")
+    if vh.stt_enabled:
+        st.caption("STT ready: Gemini 3.5 Transcribe")
+    else:
+        st.caption("STT disabled: set GEMINI_API_KEY to enable voice input. Text mode works offline.")
 
     st.title("🛡️ API Call State")
     if st.session_state.call_id:
@@ -245,6 +272,29 @@ def _estimate_transcript_confidence(transcript: str) -> float:
     return max(0.05, min(score, 0.98))
 
 
+def _synthesize_optional_tts(text: str) -> bytes | None:
+    vh = st.session_state.voice_handler
+    if not (st.session_state.get("enable_tts") and vh.tts_enabled and text):
+        return None
+    try:
+        return vh.text_to_speech_bytes(text)
+    except Exception as exc:
+        st.warning(f"TTS playback unavailable: {exc}")
+        return None
+
+
+def _infer_audio_mime_type(voice_audio) -> str:
+    explicit_type = getattr(voice_audio, "type", None)
+    if isinstance(explicit_type, str) and explicit_type.startswith("audio/"):
+        return explicit_type
+    name = getattr(voice_audio, "name", None)
+    if isinstance(name, str) and name:
+        suffix = Path(name).suffix.lower()
+        if suffix in _SUFFIX_TO_MIME:
+            return _SUFFIX_TO_MIME[suffix]
+    return "audio/wav"
+
+
 def _run_user_turn(user_input: str) -> None:
     st.session_state.messages.append({"role": "user", "content": user_input})
 
@@ -253,11 +303,11 @@ def _run_user_turn(user_input: str) -> None:
     turn_event = {
         "event_type": "user_utterance",
         "transcript": user_input,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "current_local_date": now.date().isoformat(),
         "current_local_time": now.strftime("%H:%M"),
         "timezone": tz,
-        "language": "en-US"
+        "language": "en-US",
     }
 
     with st.spinner("Agent processing..."):
@@ -267,19 +317,21 @@ def _run_user_turn(user_input: str) -> None:
             "call_state": st.session_state.call_state,
             "party_profile": party_profile,
             "account_context": account_context,
-            "policy_config": policy_config
+            "policy_config": policy_config,
         }
         response = httpx.post(f"{API_URL}/call/turn", json=payload)
 
         if response.status_code == 200:
             data = response.json()
             st.session_state.call_state = data["call_state"]
-            st.session_state.messages.append({"role": "assistant", "content": data["assistant_text"]})
-
-            with st.chat_message("assistant"):
-                st.write(data["assistant_text"])
-                audio_path = st.session_state.voice_handler.text_to_speech(data["assistant_text"])
-                st.audio(audio_path)
+            audio_bytes = _synthesize_optional_tts(data["assistant_text"])
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": data["assistant_text"],
+                    "audio_bytes": audio_bytes,
+                }
+            )
             st.rerun()
         else:
             st.error(f"API Error: {response.text}")
@@ -293,62 +345,74 @@ if st.session_state.call_state is None:
             data = response.json()
             st.session_state.call_id = data["call_id"]
             st.session_state.call_state = data["call_state"]
-            st.session_state.messages.append({"role": "assistant", "content": data["assistant_text"]})
-            # Play initial audio
-            audio_path = st.session_state.voice_handler.text_to_speech(data["assistant_text"])
-            st.audio(audio_path)
+            audio_bytes = _synthesize_optional_tts(data["assistant_text"])
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": data["assistant_text"],
+                    "audio_bytes": audio_bytes,
+                }
+            )
         else:
             st.error("Failed to connect to API. Is the server running?")
 
-# Display messages
+# Display messages (including optional in-browser audio playback)
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
+        if msg.get("audio_bytes"):
+            st.audio(msg["audio_bytes"], format="audio/mpeg")
 
-# Voice Input (MVP): turn-based.
-voice_widget_key = f"voice_input_{st.session_state.voice_input_nonce}"
-supports_audio_input = hasattr(st, "audio_input")
-if supports_audio_input:
-    st.caption("Mic mode active: record directly in your browser.")
-    voice_audio = st.audio_input(
-        "Record your response",
-        disabled=is_call_ended,
-        key=voice_widget_key,
-    )
-else:
-    st.warning(
-        "Direct mic capture is unavailable in this Streamlit version. "
-        "Please upgrade Streamlit, or upload a short audio clip."
-    )
-    voice_audio = None if is_call_ended else st.file_uploader(
-        "Upload recorded response",
-        type=["wav", "mp3", "m4a", "ogg"],
-        accept_multiple_files=False,
-        key=voice_widget_key,
-    )
+# Voice Input (opt-in Gemini STT, in-memory only — zero disk writes).
+voice_audio = None
+if st.session_state.voice_handler.stt_enabled:
+    voice_widget_key = f"voice_input_{st.session_state.voice_input_nonce}"
+    supports_audio_input = hasattr(st, "audio_input")
+    if supports_audio_input:
+        st.caption("Mic mode active: record directly in your browser.")
+        voice_audio = st.audio_input(
+            "Record your response",
+            disabled=is_call_ended,
+            key=voice_widget_key,
+        )
+    else:
+        st.warning(
+            "Direct mic capture is unavailable in this Streamlit version. "
+            "Please upgrade Streamlit, or upload a short audio clip."
+        )
+        voice_audio = None if is_call_ended else st.file_uploader(
+            "Upload recorded response",
+            type=["wav", "mp3", "m4a", "ogg"],
+            accept_multiple_files=False,
+            key=voice_widget_key,
+        )
 
 if voice_audio and not is_call_ended:
     audio_bytes = voice_audio.getvalue()
     audio_digest = hashlib.sha256(audio_bytes).hexdigest()
     if audio_digest != st.session_state.last_audio_digest:
         st.session_state.last_audio_digest = audio_digest
-        tmp_dir = Path("runtime/tmp_audio")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = tmp_dir / f"user_input_{audio_digest[:16]}.wav"
-        with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
+        mime_type = _infer_audio_mime_type(voice_audio)
 
         with st.spinner("Transcribing audio..."):
             start_ts = time.perf_counter()
-            transcript = st.session_state.voice_handler.transcribe_audio(str(audio_path)).strip()
-            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            try:
+                transcript = st.session_state.voice_handler.transcribe_audio_bytes(
+                    audio_bytes,
+                    mime_type=mime_type,
+                ).strip()
+                elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            except Exception as exc:
+                st.warning(f"Audio transcription failed: {exc}")
+                transcript = ""
+                elapsed_ms = None
 
         if transcript:
             st.session_state.pending_voice_digest = audio_digest
             st.session_state.voice_preview_text = transcript
             st.session_state.voice_preview_latency_ms = elapsed_ms
             st.session_state.voice_preview_confidence = _estimate_transcript_confidence(transcript)
-        else:
+        elif elapsed_ms is not None:
             st.warning("I could not transcribe that audio. Please try again.")
 
 if st.session_state.pending_voice_digest and not is_call_ended:

@@ -4,12 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
-from dotenv import load_dotenv
-
+from typing import Any
 from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
 
 # Ensure project root is on sys.path when running from ./scripts
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +17,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.outbound_voice_agent import CallState, handle_turn, start_call  # noqa: E402
 from src.outbound_voice_agent.agent import TurnEvent  # noqa: E402
-from src.voice_handler import VoiceHandler # noqa: E402
 
 # Load environment variables
 load_dotenv()
@@ -28,13 +27,30 @@ def main() -> int:
     parser.add_argument("--scenario", type=str, default=None, help="Path to a scenario JSON file to replay.")
     parser.add_argument("--timezone", type=str, default="America/Chicago")
     parser.add_argument("--language", type=str, default="en-US")
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        default=False,
+        help="Enable optional ElevenLabs TTS playback (requires ELEVENLABS_API_KEY).",
+    )
     args = parser.parse_args()
 
     party_profile, account_context, policy_config = default_context()
 
     tz = ZoneInfo(args.timezone)
     call_state = CallState()
-    voice_handler = VoiceHandler()
+    voice_handler: Any | None = None
+    if args.voice:
+        from src.voice_handler import VoiceHandler
+
+        candidate = VoiceHandler()
+        if candidate.tts_enabled:
+            voice_handler = candidate
+        else:
+            print(
+                "Warning: --voice requested but ELEVENLABS_API_KEY is not set; continuing in text-only mode.",
+                file=sys.stderr,
+            )
 
     # Initial outbound prompt
     initial = start_call(call_state=call_state, party_profile=party_profile)
@@ -69,12 +85,12 @@ def main() -> int:
 def run_interactive(
     *,
     call_state: CallState,
-    party_profile: Dict[str, Any],
-    account_context: Dict[str, Any],
-    policy_config: Dict[str, Any],
+    party_profile: dict[str, Any],
+    account_context: dict[str, Any],
+    policy_config: dict[str, Any],
     tz: ZoneInfo,
     language: str,
-    voice_handler: VoiceHandler,
+    voice_handler: Any | None = None,
 ) -> int:
     print("\nType your responses. Press Enter on a blank line to simulate silence. Type 'quit' to exit.\n")
     while call_state.phase != "ended":
@@ -83,7 +99,7 @@ def run_interactive(
             break
 
         now_local = datetime.now(tz)
-        now_utc = now_local.astimezone(timezone.utc)
+        now_utc = now_local.astimezone(UTC)
         event = TurnEvent(
             event_type="silence" if user_text == "" else "user_utterance",
             transcript=None if user_text == "" else user_text,
@@ -108,15 +124,15 @@ def run_interactive(
 
 
 def run_scenario(
-    scenario: Dict[str, Any],
+    scenario: dict[str, Any],
     *,
     call_state: CallState,
-    party_profile: Dict[str, Any],
-    account_context: Dict[str, Any],
-    policy_config: Dict[str, Any],
+    party_profile: dict[str, Any],
+    account_context: dict[str, Any],
+    policy_config: dict[str, Any],
     default_timezone: str,
     default_language: str,
-    voice_handler: VoiceHandler,
+    voice_handler: Any | None = None,
 ) -> int:
     tz_name = str(scenario.get("timezone") or default_timezone)
     lang = str(scenario.get("language") or default_language)
@@ -140,7 +156,7 @@ def run_scenario(
             raise ValueError(f"Invalid event_type at index {idx}: {event_type}")
 
         transcript = raw.get("transcript") if event_type == "user_utterance" else None
-        now_utc = sim_local.astimezone(timezone.utc)
+        now_utc = sim_local.astimezone(UTC)
         event = TurnEvent(
             event_type=event_type,
             transcript=transcript,
@@ -174,16 +190,21 @@ def run_scenario(
     return 0
 
 
-def print_output(user_text: Optional[str], result: Dict[str, Any], call_state: CallState, voice_handler: VoiceHandler) -> None:
+def print_output(
+    user_text: str | None,
+    result: dict[str, Any],
+    call_state: CallState,
+    voice_handler: Any | None = None,
+) -> None:
     assistant_text = result.get("assistant_text", "")
     intent = result.get("assistant_intent", "")
     actions = result.get("actions", [])
     nlu = result.get("nlu")
 
     print(f"Assistant says: {assistant_text}")
-    
-    # Live voice streaming
-    if assistant_text:
+
+    # Optional live voice playback when --voice is enabled.
+    if voice_handler is not None and assistant_text:
         voice_handler.text_to_speech_stream(assistant_text)
 
     print(f"Intent: {intent}")
@@ -207,7 +228,7 @@ def print_output(user_text: Optional[str], result: Dict[str, Any], call_state: C
     print("-" * 72)
 
 
-def default_context() -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def default_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     party_profile = {
         "target_name": "Alex Morgan",
         "target_preferred_name": "Alex",
@@ -249,8 +270,8 @@ def default_context() -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     return party_profile, account_context, policy_config
 
 
-def load_scenario(path: Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+def load_scenario(path: Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
         content = json.load(f)
     if isinstance(content, list):
         return {"name": path.stem, "events": content}
