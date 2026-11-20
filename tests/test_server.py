@@ -221,6 +221,7 @@ class ServerApiTests(unittest.TestCase):
         )
         self.assertEqual(stop_resp.status_code, 200)
         self.assertTrue(stop_resp.json()["call_state"]["cease_contact_requested"])
+        self.assertIs(stop_resp.json()["cease_contact_persisted"], True)
 
         suppressions = server.attempt_store.get_suppressions(account_ref)
         self.assertTrue(suppressions["cease_contact"])
@@ -241,6 +242,76 @@ class ServerApiTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason_code, "blocked_suppression_cease_contact")
         self.assertFalse(decision.retryable)
+
+    def test_call_start_requires_account_ref(self):
+        party_profile, _, _ = _default_context()
+        for body in (
+            {"party_profile": party_profile},
+            {"party_profile": party_profile, "account_ref": ""},
+            {"party_profile": party_profile, "account_ref": None},
+        ):
+            with self.subTest(body=body):
+                resp = self.client.post("/call/start", json=body)
+                self.assertEqual(resp.status_code, 422)
+        self.assertEqual(server.call_store.list_calls(), [])
+
+    def test_cease_contact_uses_account_bound_at_call_start(self):
+        party_profile, account_context, policy_config = _default_context()
+        call_id = self.client.post(
+            "/call/start",
+            json={"party_profile": party_profile, "account_ref": "acct_bound_1"},
+        ).json()["call_id"]
+
+        stop_resp = self.client.post(
+            "/call/turn",
+            json={
+                "call_id": call_id,
+                "turn_event": _turn_event("stop calling me"),
+                "party_profile": party_profile,
+                "account_context": account_context,
+                "policy_config": policy_config,
+                "account_ref": "acct_someone_else",
+            },
+        )
+        self.assertEqual(stop_resp.status_code, 200)
+        self.assertTrue(server.attempt_store.get_suppressions("acct_bound_1")["cease_contact"])
+        self.assertFalse(server.attempt_store.get_suppressions("acct_someone_else")["cease_contact"])
+
+    def test_failed_suppression_write_is_not_lost_on_retry(self):
+        party_profile, account_context, policy_config = _default_context()
+        account_ref = "acct_cease_retry"
+        call_id = self.client.post(
+            "/call/start",
+            json={"party_profile": party_profile, "account_ref": account_ref},
+        ).json()["call_id"]
+        stop_body = {
+            "call_id": call_id,
+            "turn_event": _turn_event("stop calling me"),
+            "party_profile": party_profile,
+            "account_context": account_context,
+            "policy_config": policy_config,
+        }
+
+        real_set_suppression = server.attempt_store.set_suppression
+
+        def failing_set_suppression(**kwargs):
+            raise OSError("disk full")
+
+        server.attempt_store.set_suppression = failing_set_suppression
+        try:
+            failed = self.client.post("/call/turn", json=stop_body)
+        finally:
+            server.attempt_store.set_suppression = real_set_suppression
+
+        self.assertEqual(failed.status_code, 500)
+        # The call must still be open, so the retry replays the stop request.
+        self.assertEqual(self.client.get(f"/call/{call_id}").json()["status"], "active")
+
+        retry = self.client.post("/call/turn", json=stop_body)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json()["assistant_intent"], "close")
+        self.assertIs(retry.json()["cease_contact_persisted"], True)
+        self.assertTrue(server.attempt_store.get_suppressions(account_ref)["cease_contact"])
 
 
 if __name__ == "__main__":
