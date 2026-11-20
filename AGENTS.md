@@ -43,6 +43,8 @@ Canonical instructions for AI coding agents working in `collections-voice-agent`
 8. **Single-instance persistence boundary:** Local JSON stores use in-process `threading.Lock`; keep `--workers 1` in `Dockerfile` and `--max-instances 1` for the Cloud Run API service.
 9. **Offline-first tests:** `tests/conftest.py` clears all AI/voice env vars and blocks non-`AF_UNIX` outbound sockets. Every test must pass 100% offline with zero API keys.
 10. **No secrets or live credentials:** Never read, print, or commit `.env` or real API keys.
+11. **Confirm before recording a promise:** `_confirm_ptp()` may be reached directly only for an unambiguous full-balance date. A negated, hedged, partial-amount, or post-refusal proposal must go through `confirm_payment_date` and an explicit yes, and a reply naming a different date or amount is a counter-offer, never acceptance.
+12. **Every call has an account:** `/call/start` requires `account_ref`, and an in-call cease-contact suppression is written before the ended call is persisted.
 
 ## Standard Commands (`uv`)
 ```bash
