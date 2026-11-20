@@ -29,7 +29,7 @@ Verify the running container in another terminal:
 curl -sf http://127.0.0.1:8080/health
 curl -sf -X POST http://127.0.0.1:8080/call/start \
   -H "Content-Type: application/json" \
-  -d '{"party_profile":{"target_name":"Alex Morgan"}}'
+  -d '{"party_profile":{"target_name":"Alex Morgan"},"account_ref":"acct_demo_001"}'
 curl -sf http://127.0.0.1:8080/metrics/summary
 ```
 

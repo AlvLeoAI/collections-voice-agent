@@ -103,6 +103,9 @@ class CallState(BaseModel):
     # Count of consecutive low-confidence clarification prompts.
     clarification_attempts: int = 0
 
+    # Count of pre-verification re-prompts asking whether the target was reached.
+    target_prompt_attempts: int = 0
+
     # Retained as empty string for backward schema compatibility; must not persist raw user transcripts.
     last_user_utterance: str = ""
 

@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from dataclasses import asdict
@@ -30,6 +31,8 @@ from src.api.storage_utils import InvalidIdError  # noqa: E402
 from src.outbound_voice_agent import CallState, handle_turn, start_call  # noqa: E402
 from src.outbound_voice_agent.agent import TurnEvent  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
 RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "runtime"))
 
 app = FastAPI(title="Outbound Agent API")
@@ -40,7 +43,8 @@ attempt_store = JsonContactAttemptStore(root_dir=RUNTIME_DIR / "attempts")
 
 class StartCallRequest(BaseModel):
     party_profile: dict[str, Any]
-    account_ref: str | None = None
+    # Required: an in-call cease-contact request must always have an account to be recorded against.
+    account_ref: str = Field(min_length=1, max_length=128)
 
 
 class TurnRequest(BaseModel):
@@ -157,6 +161,34 @@ async def api_handle_turn(request: TurnRequest):
             policy_config=request.policy_config,
         )
 
+        actions = result.get("actions", [])
+        cease_requested = result["assistant_intent"] != "already_closed" and (
+            result["call_state"].cease_contact_requested
+            or any(action.get("action") == "mark_do_not_contact" for action in actions)
+        )
+
+        # Record the suppression BEFORE the ended call is persisted. If this write fails the
+        # request fails with the call still open, so a retry replays the stop request instead
+        # of hitting an already-closed call with the suppression lost.
+        cease_contact_persisted: bool | None = None
+        if cease_requested:
+            # The account bound at /call/start wins; the request value only covers legacy records.
+            account_ref = record.get("account_ref") or request.account_ref
+            if account_ref:
+                attempt_store.set_suppression(
+                    account_ref=account_ref,
+                    flag="cease_contact",
+                    reason="in_call_stop_request",
+                    call_id=request.call_id,
+                )
+                cease_contact_persisted = True
+            else:
+                cease_contact_persisted = False
+                logger.warning(
+                    "cease_contact requested but call has no account_ref; suppression NOT persisted call_id=%s",
+                    request.call_id,
+                )
+
         call_store.append_turn(
             call_id=request.call_id,
             turn_event=event,
@@ -166,20 +198,6 @@ async def api_handle_turn(request: TurnRequest):
             nlu=result.get("nlu"),
         )
 
-        actions = result.get("actions", [])
-        if result["assistant_intent"] != "already_closed" and (
-            result["call_state"].cease_contact_requested
-            or any(action.get("action") == "mark_do_not_contact" for action in actions)
-        ):
-            account_ref = request.account_ref or record.get("account_ref")
-            if account_ref:
-                attempt_store.set_suppression(
-                    account_ref=account_ref,
-                    flag="cease_contact",
-                    reason="in_call_stop_request",
-                    call_id=request.call_id,
-                )
-
         return {
             "call_id": request.call_id,
             "assistant_text": result["assistant_text"],
@@ -187,6 +205,8 @@ async def api_handle_turn(request: TurnRequest):
             "actions": actions,
             "nlu": result.get("nlu"),
             "call_state": result["call_state"].model_dump(mode="json"),
+            # True/False only on the turn that requested cease-contact; None otherwise.
+            "cease_contact_persisted": cease_contact_persisted,
         }
     except HTTPException:
         raise

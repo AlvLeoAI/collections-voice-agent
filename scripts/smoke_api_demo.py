@@ -142,7 +142,11 @@ def main() -> int:
             if args.calls_dir or tmp_runtime is not None:
                 server.call_store = JsonCallStore(root_dir=persisted_dir)
 
-            start_data = asyncio.run(api_start_call(StartCallRequest(party_profile=party_profile)))
+            start_data = asyncio.run(
+                api_start_call(
+                    StartCallRequest(party_profile=party_profile, account_ref=account_context["case_id"])
+                )
+            )
             call_id = start_data["call_id"]
             call_state = start_data["call_state"]
             print(f"call_id={call_id}")
@@ -168,7 +172,10 @@ def main() -> int:
             persisted_label = "(temporary runtime cleaned up)" if tmp_runtime is not None and not args.calls_dir else str(persisted_dir / f"{call_id}.json")
     else:
         with httpx.Client(timeout=30.0) as client:
-            start_resp = client.post(f"{args.base_url}/call/start", json={"party_profile": party_profile})
+            start_resp = client.post(
+                f"{args.base_url}/call/start",
+                json={"party_profile": party_profile, "account_ref": account_context["case_id"]},
+            )
             if start_resp.status_code != 200:
                 print(f"ERROR /call/start [{start_resp.status_code}]: {start_resp.text}")
                 return 1

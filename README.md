@@ -1,6 +1,6 @@
 # Outbound Collections Voice Agent
 
-A portfolio demonstration of **engineering judgment on when *not* to use an LLM** in a regulated consumer-finance domain (outbound collections). Deterministic Python controls every phase transition, right-party ZIP verification gate, payment-date bound (`today <= ptp_date <= end_of_month`), `Decimal`-based partial-offer calculation, and fail-closed pre-dial compliance check. Optional **Google Gemini 3.5 Transcribe** (`gemini-3.5-transcribe`, `store=False`) and **ElevenLabs** (`eleven_turbo_v2_5`) adapters are strictly lazy-loaded for voice I/O — the core agent, FastAPI backend, Streamlit text mode, CLI replays, and all 84 tests (+ 17 subtests) run completely offline with **zero API keys**.
+A portfolio demonstration of **engineering judgment on when *not* to use an LLM** in a regulated consumer-finance domain (outbound collections). Deterministic Python controls every phase transition, right-party ZIP verification gate, payment-date bound (`today <= ptp_date <= end_of_month`), `Decimal`-based partial-offer calculation, and fail-closed pre-dial compliance check. Optional **Google Gemini 3.5 Transcribe** (`gemini-3.5-transcribe`, `store=False`) and **ElevenLabs** (`eleven_turbo_v2_5`) adapters are strictly lazy-loaded for voice I/O — the core agent, FastAPI backend, Streamlit text mode, CLI replays, and all 99 tests (+ 35 subtests) run completely offline with **zero API keys**.
 
 **Repository**: https://github.com/AlvLeoAI/collections-voice-agent
 
@@ -9,7 +9,8 @@ A portfolio demonstration of **engineering judgment on when *not* to use an LLM*
 - **Deterministic phase-based state machine** — `pre_verification` → `verification` → `post_verification` → `ended` with sub-millisecond turn routing and reproducible scenario replay
 - **Hard-coded right-party verification gate** — ZIP confirmation enforced structurally inside `_handle_verification()` before `_deliver_disclosure_and_start_negotiation()` is ever reachable; no debt, amount, or creditor details are disclosed before `right_party_verified == True`
 - **Bounded payment-date validation** — `_validate_ptp_date()` enforces `today <= ptp_date <= end_of_month`, rejecting past dates (`in_past`) and out-of-month dates (`after_month_end`) with conversational reconduction
-- **Dynamic partial payment offers** — `_build_partial_offer()` computes a 50% `Decimal` (`ROUND_HALF_UP`) partial offer clamped to the current month-end and routes through `confirm_payment_date`
+- **Confirm-before-record promises** — A promise-to-pay is recorded directly only for an unambiguous full-balance date. A date that is negated (`"No, not February 25"`), hedged, tied to a different amount, or given after a refusal is read back with its amount and needs an explicit yes
+- **Dynamic partial payment offers** — `_build_partial_offer()` computes a 50% `Decimal` (`ROUND_HALF_UP`) partial offer clamped to the current month-end and routes through `confirm_payment_date`; a partial amount the caller states with a currency marker (`"$50"`, `"fifty dollars"`) is parsed by `_extract_stated_amount()` and confirmed at that amount, never at the full balance
 - **Ambiguous date normalization** — ES/EN date utility (`date_normalizer.py`) parses ISO dates, `"tomorrow"` / `"mañana"`, `"end of month"` / `"fin de mes"`, `"next month"` / `"próximo mes"`, explicit month-day phrases, and weekday names with `needs_confirmation` gating
 - **Scored English-only intent classification** — Regex-based classifier (`intent_classifier.py`) with 13 intent labels, priority ranking, curly-apostrophe normalization, negation-aware guards, and low-confidence ambiguity detection (`is_low_confidence_unknown()`)
 - **Voice-first response guard** — `_enforce_voice_first()` keeps every assistant turn to ≤ 2 short sentences and ≤ 1 question while preserving question sentences
@@ -17,7 +18,7 @@ A portfolio demonstration of **engineering judgment on when *not* to use an LLM*
 - **Outbound job orchestration** — Queue-based worker with cron/webhook/manual triggers, expired-lease reclamation (`JobEvent.LEASE_EXPIRED`), deterministic UTC-day or explicit `idempotency_key` deduplication, exponential backoff retries, and dead-letter handling
 - **PII-safe atomic persistence** — Atomic temp-file + `fsync` + `os.replace()` JSON writes (`storage_utils.py`), path-traversal ID validation (`validate_safe_id()`), unconditional `last_user_utterance = ""` redaction on disk (`_sanitize_call_state()`), and metadata-only voice logs
 - **Opt-in voice adapters** — Lazy-loaded Gemini 3.5 Transcribe STT (`store=False`, in-memory browser transcription) and ElevenLabs in-browser TTS (`st.audio()`) plus optional local CLI playback (`--voice`)
-- **Offline CI & test suite** — 84 tests (+ 17 subtests) running under `pytest` with outbound TCP/UDP sockets blocked by `tests/conftest.py`, `ruff` linting, and GitHub Actions CI
+- **Offline CI & test suite** — 99 tests (+ 35 subtests) running under `pytest` with outbound TCP/UDP sockets blocked by `tests/conftest.py`, `ruff` linting, and GitHub Actions CI
 
 ## Project Structure
 
@@ -147,8 +148,8 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for local Docker verification and Google Clou
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health probe returning `{"status": "ok", "service": "collections-voice-agent", "llm_in_core_path": false}` |
-| `POST` | `/call/start` | Start a new call (supports optional `account_ref`), returns `call_id`, initial response, and `call_state` |
-| `POST` | `/call/turn` | Advance call state with a `TurnEvent` (optional `account_ref`); persists in-call `cease_contact` suppressions |
+| `POST` | `/call/start` | Start a new call for a required `account_ref` (`422` if missing or empty), returns `call_id`, initial response, and `call_state` |
+| `POST` | `/call/turn` | Advance call state with a `TurnEvent`; an in-call cease-contact request is persisted against the account bound at `/call/start` before the ended call is saved, and reported as `cease_contact_persisted` |
 | `GET` | `/call/{call_id}` | Retrieve sanitized call summary with turn/action history and final outcome |
 | `GET` | `/metrics/summary` | Aggregated call metrics (PTP rate, time-to-PTP, daily trends) and job/compliance counts |
 
@@ -175,14 +176,14 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for local Docker verification and Google Clou
 
 ## Test Suite
 
-- **84 tests (+ 17 subtests)** via `uv run pytest -v`, running in < 1 second with **zero API keys** and all outbound non-UNIX sockets blocked by `tests/conftest.py`.
+- **99 tests (+ 35 subtests)** via `uv run pytest -v`, running in < 1 second with **zero API keys** and all outbound non-UNIX sockets blocked by `tests/conftest.py`.
 - See [TESTING.md](TESTING.md) for the full verification checklist and [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for architecture and trade-offs.
 
 ## Honest Scope & Known Limitations
 
 1. **Single-process JSON persistence (`runtime/`):** Call records, jobs, and attempt/suppression ledgers use local JSON files with in-process `threading.Lock` and atomic `os.replace()` writes. On Cloud Run, the API service must run with `--max-instances 1` and `--workers 1`, and local container disk is ephemeral across restarts. Production deployments require a shared database (e.g., Cloud SQL PostgreSQL) and managed queue (e.g., Cloud Tasks or Pub/Sub).
 2. **English-only (`en-US`) conversation & NLU vs. ES/EN date utility:** Disclosures, templates, and `intent_classifier.py` are explicitly scoped to English (`en-US`), while `date_normalizer.py` retains ES/EN phrase helpers. Non-English utterances (such as `"sí"`) intentionally fall back to low-confidence `unknown` → clarification → human escalation rather than risking missed non-English disputes or cease-contact requests.
-3. **Pattern-based NLU coverage limits:** Regex rules trade semantic generalization for deterministic auditability. Unusual phrasing outside covered patterns relies on ambiguity checks and the 2-strike low-confidence escalation path.
+3. **Pattern-based NLU coverage limits:** Regex rules trade semantic generalization for deterministic auditability. Unusual phrasing outside covered patterns relies on ambiguity checks and the 2-strike low-confidence escalation path. Stated amounts are recognized only with a currency marker (`$`, `dollars`, `bucks`), and `"today"` is handled as a yes/no answer rather than as a parsed date.
 4. **No real telephony or media streaming:** There is no SIP/PSTN/Twilio integration, real-time duplex WebRTC transport, or barge-in handling.
 5. **Opt-in external voice adapters vs. offline tests:** Live STT (`gemini-3.5-transcribe`) and TTS (`eleven_turbo_v2_5`) depend on external APIs when enabled; unit tests exercise those code paths using deterministic in-memory test doubles.
 6. **No API authentication middleware:** Demo REST endpoints assume a local sandbox or Cloud Run IAM / gateway perimeter rather than built-in bearer-token auth.

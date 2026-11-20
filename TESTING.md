@@ -89,14 +89,16 @@ sleep 2
 curl -sf http://127.0.0.1:18080/health
 curl -sf -X POST http://127.0.0.1:18080/call/start \
   -H "Content-Type: application/json" \
-  -d '{"party_profile":{"target_name":"Alex Morgan"}}'
+  -d '{"party_profile":{"target_name":"Alex Morgan"},"account_ref":"acct_demo_001"}'
 docker stop cva-smoke
 ```
 
 ## Expected Core Behaviors
 
 - No debt, balance, or creditor disclosure before right-party ZIP verification succeeds.
-- Wrong-party responses in `pre_verification` or `verification` close cleanly as `wrong_party` without disclosure.
+- Wrong-party responses in `pre_verification` or `verification` close cleanly as `wrong_party` without disclosure; a plain `"no"` to the opening question does the same, and other non-answers are re-prompted at most twice before `target_unconfirmed`.
+- A negated, hedged, or partial-amount payment statement (`"No, not February 25"`, `"I can do 50 dollars on February 25"`) is read back with its amount and recorded only after an explicit yes.
+- `/call/start` without `account_ref` returns `422`.
 - Dispute language triggers immediate human escalation (`escalated_dispute`).
 - Past dates and post-month-end dates are rejected with reconduction to a valid current-month date.
 - In-call `"stop calling me"` persists `cease_contact=True` in the account suppression ledger, blocking future outbound dials even if a subsequent job has `cease_contact=False`.

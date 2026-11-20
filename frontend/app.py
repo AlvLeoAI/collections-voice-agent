@@ -165,6 +165,7 @@ with st.sidebar:
         st.session_state.voice_preview_text = ""
         st.session_state.voice_preview_latency_ms = None
         st.session_state.voice_preview_confidence = None
+        st.session_state.cease_contact_notice = None
         st.rerun()
 
 party_profile = {
@@ -236,6 +237,8 @@ with st.container():
 is_call_ended = bool(st.session_state.call_state and st.session_state.call_state.get("phase") == "ended")
 if is_call_ended:
     st.info("Call ended. Click 'Reset Call' in the sidebar to start a new one.")
+    if st.session_state.get("cease_contact_notice"):
+        st.warning(st.session_state.cease_contact_notice)
 
 
 def _clear_pending_voice() -> None:
@@ -324,6 +327,11 @@ def _run_user_turn(user_input: str) -> None:
         if response.status_code == 200:
             data = response.json()
             st.session_state.call_state = data["call_state"]
+            if data.get("cease_contact_persisted"):
+                st.session_state.cease_contact_notice = (
+                    f"Cease-contact recorded for account `{st.session_state.profile_case_id}`. "
+                    "Future outbound jobs for it are blocked by the pre-dial gate."
+                )
             audio_bytes = _synthesize_optional_tts(data["assistant_text"])
             st.session_state.messages.append(
                 {
@@ -340,7 +348,11 @@ def _run_user_turn(user_input: str) -> None:
 if st.session_state.call_state is None:
     # Start the call via API
     with st.spinner("Connecting to Agent API..."):
-        response = httpx.post(f"{API_URL}/call/start", json={"party_profile": party_profile})
+        # The case ID is the account reference, so an in-call "stop calling me" is recorded against it.
+        response = httpx.post(
+            f"{API_URL}/call/start",
+            json={"party_profile": party_profile, "account_ref": st.session_state.profile_case_id},
+        )
         if response.status_code == 200:
             data = response.json()
             st.session_state.call_id = data["call_id"]
@@ -353,6 +365,8 @@ if st.session_state.call_state is None:
                     "audio_bytes": audio_bytes,
                 }
             )
+        elif response.status_code == 422:
+            st.error("Could not start the call: Case ID is required (it is the account reference).")
         else:
             st.error("Failed to connect to API. Is the server running?")
 

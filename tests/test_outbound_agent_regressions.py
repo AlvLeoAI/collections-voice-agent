@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from src.outbound_voice_agent import CallState, handle_turn, start_call
-from src.outbound_voice_agent.agent import TurnEvent, _enforce_voice_first
+from src.outbound_voice_agent.agent import TurnEvent, _enforce_voice_first, _extract_stated_amount
 
 
 def default_context():
@@ -422,6 +423,192 @@ class OutboundAgentRegressions(unittest.TestCase):
         self.assertTrue(self.call_state.escalation_flag)
         self.assertEqual(self.call_state.phase, "ended")
         self.assertEqual(self.call_state.end_reason, "escalated_hard_refusal")
+
+    # --- Promise-to-pay accuracy: negated dates and user-stated amounts ---
+
+    def _verify(self, local_date: tuple[int, int, int] = (2026, 2, 20)) -> None:
+        self.step("This is Alex Morgan.", local_date=local_date)
+        self.step("78701", local_date=local_date)
+        self.assertEqual(self.call_state.phase, "post_verification")
+
+    def assert_no_promise(self, result) -> None:
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(self.call_state.phase, "post_verification")
+        self.assertFalse(self.call_state.promise_to_pay.confirmed)
+        self.assertIsNone(self.call_state.promise_to_pay.date)
+
+    def test_negated_or_hedged_date_is_confirmed_never_recorded_directly(self):
+        ref_date = (2026, 2, 20)
+        for utterance in (
+            "No, not February 25",
+            "I don't get paid until February 25",
+            "Maybe February 25, I'm not sure",
+        ):
+            with self.subTest(utterance=utterance):
+                self.setUp()
+                self._verify(ref_date)
+                result = self.step(utterance, local_date=ref_date)
+
+                self.assertEqual(result["assistant_intent"], "confirm_payment_date")
+                self.assert_no_promise(result)
+                self.assertIn("$240.00", result["assistant_text"])
+                self.assertIn("February 25", result["assistant_text"])
+
+    def test_negated_date_then_no_clears_proposal_and_yes_records_it(self):
+        ref_date = (2026, 2, 20)
+        self._verify(ref_date)
+        self.step("No, not February 25", local_date=ref_date)
+        declined = self.step("No", local_date=ref_date)
+        self.assertEqual(declined["assistant_intent"], "negotiate")
+        self.assert_no_promise(declined)
+        self.assertIsNone(self.call_state.last_proposed_payment_date)
+
+        self.setUp()
+        self._verify(ref_date)
+        self.step("I don't get paid until February 25", local_date=ref_date)
+        accepted = self.step("Yes", local_date=ref_date)
+        self.assertEqual(self.call_state.end_reason, "ptp_set")
+        self.assertEqual(self.call_state.promise_to_pay.date, "2026-02-25")
+        self.assertEqual(self.call_state.promise_to_pay.amount, "240.00")
+        self.assertTrue(any(a.get("action") == "create_promise_to_pay" for a in accepted["actions"]))
+
+    def test_user_stated_partial_amount_with_date_is_confirmed_at_that_amount(self):
+        ref_date = (2026, 2, 20)
+        self._verify(ref_date)
+        self.step("I can't afford it", local_date=ref_date)
+        offer = self.step("I can do 50 dollars on February 25", local_date=ref_date)
+
+        self.assertEqual(offer["assistant_intent"], "confirm_payment_date")
+        self.assert_no_promise(offer)
+        self.assertIn("$50.00", offer["assistant_text"])
+        self.assertNotIn("240", offer["assistant_text"])
+        self.assertEqual(self.call_state.last_proposed_payment_amount, "50.00")
+
+        confirm = self.step("Yes", local_date=ref_date)
+        self.assertEqual(self.call_state.end_reason, "ptp_set")
+        self.assertEqual(self.call_state.promise_to_pay.amount, "50.00")
+        self.assertEqual(self.call_state.promise_to_pay.date, "2026-02-25")
+        self.assertIn(
+            {"action": "create_promise_to_pay", "date": "2026-02-25", "amount": "50.00"},
+            confirm["actions"],
+        )
+
+    def test_user_stated_partial_amount_without_date_stays_pending_until_date_and_yes(self):
+        ref_date = (2026, 2, 20)
+        self._verify(ref_date)
+        amount_only = self.step("I can only do $50", local_date=ref_date)
+        self.assertEqual(amount_only["assistant_intent"], "negotiate")
+        self.assert_no_promise(amount_only)
+        self.assertIn("$50.00", amount_only["assistant_text"])
+        self.assertEqual(self.call_state.last_proposed_payment_amount, "50.00")
+
+        with_date = self.step("February 25", local_date=ref_date)
+        self.assertEqual(with_date["assistant_intent"], "confirm_payment_date")
+        self.assert_no_promise(with_date)
+        self.assertIn("$50.00", with_date["assistant_text"])
+
+        self.step("Yes", local_date=ref_date)
+        self.assertEqual(self.call_state.promise_to_pay.amount, "50.00")
+        self.assertEqual(self.call_state.promise_to_pay.date, "2026-02-25")
+
+    def test_refusal_that_mentions_an_amount_is_not_an_offer(self):
+        ref_date = (2026, 2, 20)
+        self._verify(ref_date)
+        result = self.step("I can't afford even $50", local_date=ref_date)
+        self.assertEqual(result["assistant_intent"], "negotiate")
+        self.assert_no_promise(result)
+        self.assertEqual(self.call_state.negotiation_proposals_count, 1)
+        self.assertIsNone(self.call_state.last_proposed_payment_amount)
+
+    def test_date_after_a_refusal_is_read_back_with_the_amount(self):
+        ref_date = (2026, 2, 20)
+        self._verify(ref_date)
+        self.step("I can't afford it", local_date=ref_date)
+        result = self.step("February 25", local_date=ref_date)
+        self.assertEqual(result["assistant_intent"], "confirm_payment_date")
+        self.assert_no_promise(result)
+        self.assertIn("$240.00", result["assistant_text"])
+
+    def test_counter_offer_to_pending_proposal_is_not_acceptance(self):
+        self.account_context["amount_due"] = "80.00"
+        ref_date = (2026, 2, 20)
+        for counter, expected_amount, expected_date in (
+            ("I can do $20", "20.00", None),
+            ("Sure, on February 27", "40.00", "2026-02-27"),
+        ):
+            with self.subTest(counter=counter):
+                self.setUp()
+                self.account_context["amount_due"] = "80.00"
+                self._verify(ref_date)
+                self.step("No, not today.", local_date=ref_date)
+                offer = self.step("No.", local_date=ref_date)
+                self.assertIn("$40.00", offer["assistant_text"])
+                self.assertEqual(self.call_state.last_proposed_payment_date, "2026-02-25")
+
+                result = self.step(counter, local_date=ref_date)
+                self.assert_no_promise(result)
+                self.assertEqual(self.call_state.last_proposed_payment_amount, expected_amount)
+                self.assertEqual(self.call_state.last_proposed_payment_date, expected_date)
+
+    def test_yes_to_partial_offer_for_today_records_the_partial_amount(self):
+        self.account_context["amount_due"] = "80.00"
+        ref_date = (2026, 2, 28)
+        self._verify(ref_date)
+        self.step("No, not today.", local_date=ref_date)
+        offer = self.step("No.", local_date=ref_date)
+        self.assertIn("$40.00 today", offer["assistant_text"])
+
+        self.step("Can do.", local_date=ref_date)
+        self.assertEqual(self.call_state.end_reason, "ptp_set")
+        self.assertEqual(self.call_state.promise_to_pay.amount, "40.00")
+        self.assertEqual(self.call_state.promise_to_pay.date, "2026-02-28")
+
+    def test_stated_amount_parser_requires_a_currency_marker(self):
+        cases = {
+            "$50": Decimal("50.00"),
+            "I can do 50 dollars": Decimal("50.00"),
+            "fifty bucks": Decimal("50.00"),
+            "a hundred and twenty dollars": Decimal("120.00"),
+            "$1,200.50 is too much": Decimal("1200.50"),
+            "February 25": None,
+            "78701": None,
+            "I can pay on the 25th": None,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(_extract_stated_amount(text), expected)
+
+    # --- Pre-verification loop bounds ---
+
+    def test_plain_no_in_pre_verification_closes_as_wrong_party(self):
+        result = self.step("No")
+        self.assertEqual(result["assistant_intent"], "close")
+        self.assertEqual(self.call_state.phase, "ended")
+        self.assertEqual(self.call_state.end_reason, "wrong_party")
+        self.assertTrue(self.call_state.wrong_party_indicated)
+        self.assertEqual(self.call_state.turn_count, 2)
+        self.assertNotIn("debt", result["assistant_text"].lower())
+
+    def test_conflicting_yes_no_in_pre_verification_clarifies_instead_of_verifying(self):
+        result = self.step("No, this is his wife")
+        self.assertEqual(result["assistant_intent"], "request_target")
+        self.assertEqual(self.call_state.phase, "pre_verification")
+        self.assertEqual(self.call_state.target_reached, "unknown")
+
+    def test_pre_verification_reprompts_are_capped(self):
+        for utterance in ("Who is this?", "I'm driving right now"):
+            with self.subTest(utterance=utterance):
+                self.setUp()
+                first = self.step(utterance)
+                second = self.step(utterance)
+                self.assertEqual(first["assistant_intent"], "request_target")
+                self.assertEqual(second["assistant_intent"], "request_target")
+
+                third = self.step(utterance)
+                self.assertEqual(third["assistant_intent"], "close")
+                self.assertEqual(self.call_state.phase, "ended")
+                self.assertEqual(self.call_state.end_reason, "target_unconfirmed")
+                self.assertNotIn("debt", third["assistant_text"].lower())
 
 
 if __name__ == "__main__":
