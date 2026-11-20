@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
-def _parse_iso_datetime(value: Any, *, assume_utc_for_naive: bool) -> Optional[datetime]:
+def _parse_iso_datetime(value: Any, *, assume_utc_for_naive: bool) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
 
@@ -23,12 +23,12 @@ def _parse_iso_datetime(value: Any, *, assume_utc_for_naive: bool) -> Optional[d
     if parsed.tzinfo is None:
         if not assume_utc_for_naive:
             return None
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
 
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
-def _turn_has_ptp_action(turn: Dict[str, Any]) -> bool:
+def _turn_has_ptp_action(turn: dict[str, Any]) -> bool:
     actions = turn.get("actions")
     if not isinstance(actions, list):
         return False
@@ -43,9 +43,9 @@ def _turn_has_ptp_action(turn: Dict[str, Any]) -> bool:
     return False
 
 
-def _extract_ptp_info(record: Dict[str, Any]) -> Tuple[bool, Optional[datetime]]:
+def _extract_ptp_info(record: dict[str, Any]) -> tuple[bool, datetime | None]:
     has_ptp = False
-    ptp_timestamp: Optional[datetime] = None
+    ptp_timestamp: datetime | None = None
 
     for turn in record.get("turns", []):
         if not isinstance(turn, dict) or not _turn_has_ptp_action(turn):
@@ -74,12 +74,12 @@ def _extract_ptp_info(record: Dict[str, Any]) -> Tuple[bool, Optional[datetime]]
 
 
 def _build_daily_rows(
-    daily: Dict[str, Dict[str, int]],
+    daily: dict[str, dict[str, int]],
     *,
     trend_days: int,
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    unknown_row: Optional[Dict[str, Any]] = None
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    unknown_row: dict[str, Any] | None = None
 
     for date_key, counters in daily.items():
         row = {
@@ -107,18 +107,18 @@ def _build_daily_rows(
 
 
 def build_metrics_summary(
-    records: List[Dict[str, Any]],
+    records: list[dict[str, Any]],
     *,
     trend_days: int = 14,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     status_counts: Counter[str] = Counter()
-    daily: Dict[str, Dict[str, int]] = defaultdict(
+    daily: dict[str, dict[str, int]] = defaultdict(
         lambda: {"calls_total": 0, "ended_calls": 0, "ptp_calls_ended": 0}
     )
 
     ptp_calls_total = 0
     ptp_calls_ended = 0
-    time_to_ptp_seconds: List[float] = []
+    time_to_ptp_seconds: list[float] = []
 
     for record in records:
         if not isinstance(record, dict):
@@ -189,10 +189,10 @@ def build_metrics_summary(
 
 
 def build_job_metrics_summary(
-    job_records: List[Dict[str, Any]],
+    job_records: list[dict[str, Any]],
     *,
-    attempt_events: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+    attempt_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     state_counts: Counter[str] = Counter()
     outcome_counts: Counter[str] = Counter()
     error_counts: Counter[str] = Counter()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from src.api.job_store import JsonJobStore
 from src.api.outbound_orchestration import (
@@ -58,7 +58,7 @@ class JobStoreTests(unittest.TestCase):
     def test_lease_start_and_complete(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JsonJobStore(root_dir=tmpdir)
-            now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+            now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
             scheduled = (now - timedelta(minutes=1)).isoformat()
 
             job, _ = store.enqueue_job(
@@ -90,7 +90,7 @@ class JobStoreTests(unittest.TestCase):
     def test_failed_job_requeues_when_due(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JsonJobStore(root_dir=tmpdir)
-            now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+            now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
             scheduled = (now - timedelta(minutes=1)).isoformat()
 
             job, _ = store.enqueue_job(
@@ -119,7 +119,7 @@ class JobStoreTests(unittest.TestCase):
     def test_defer_from_lease_does_not_create_attempt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JsonJobStore(root_dir=tmpdir)
-            now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+            now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
             scheduled = (now - timedelta(minutes=1)).isoformat()
 
             job, _ = store.enqueue_job(
@@ -143,7 +143,7 @@ class JobStoreTests(unittest.TestCase):
     def test_cancel_job_sets_terminal_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JsonJobStore(root_dir=tmpdir)
-            now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+            now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
             scheduled = (now - timedelta(minutes=1)).isoformat()
 
             job, _ = store.enqueue_job(
@@ -157,6 +157,74 @@ class JobStoreTests(unittest.TestCase):
             canceled = store.cancel_job(job.job_id, reason_code="blocked_suppression_dnc")
             self.assertEqual(canceled.state, JobState.CANCELED)
             self.assertEqual(canceled.failure_reason, "blocked_suppression_dnc")
+
+    def test_lease_next_due_job_reclaims_expired_lease_for_second_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonJobStore(root_dir=tmpdir)
+            now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
+            scheduled = (now - timedelta(minutes=1)).isoformat()
+
+            job, _ = store.enqueue_job(
+                trigger_source=TriggerSource.MANUAL,
+                campaign_id="cmp_6",
+                payload=self._payload(),
+                policy=self._policy(),
+                scheduled_for_utc=scheduled,
+            )
+            leased_1 = store.lease_next_due_job(worker_id="worker_1", lease_seconds=30, now_utc=now)
+            self.assertIsNotNone(leased_1)
+            self.assertEqual(leased_1.lease_owner, "worker_1")
+
+            # Still leased before expiry
+            self.assertIsNone(
+                store.lease_next_due_job(worker_id="worker_2", lease_seconds=30, now_utc=now + timedelta(seconds=10))
+            )
+
+            # Reclaimed automatically once expired
+            leased_2 = store.lease_next_due_job(
+                worker_id="worker_2", lease_seconds=30, now_utc=now + timedelta(seconds=35)
+            )
+            self.assertIsNotNone(leased_2)
+            self.assertEqual(leased_2.job_id, job.job_id)
+            self.assertEqual(leased_2.lease_owner, "worker_2")
+
+    def test_enqueue_deduplicates_without_scheduled_for_utc_and_supports_custom_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonJobStore(root_dir=tmpdir)
+            j1, created_1 = store.enqueue_job(
+                trigger_source=TriggerSource.MANUAL,
+                campaign_id="cmp_7",
+                payload=self._payload(),
+                policy=self._policy(),
+            )
+            j2, created_2 = store.enqueue_job(
+                trigger_source=TriggerSource.WEBHOOK,
+                campaign_id="cmp_7",
+                payload=self._payload(),
+                policy=self._policy(),
+            )
+            self.assertTrue(created_1)
+            self.assertFalse(created_2)
+            self.assertEqual(j1.job_id, j2.job_id)
+
+            j3, created_3 = store.enqueue_job(
+                trigger_source=TriggerSource.MANUAL,
+                campaign_id="cmp_7",
+                payload=self._payload(),
+                policy=self._policy(),
+                idempotency_key="caller_key_1",
+            )
+            j4, created_4 = store.enqueue_job(
+                trigger_source=TriggerSource.MANUAL,
+                campaign_id="cmp_7",
+                payload=self._payload(),
+                policy=self._policy(),
+                idempotency_key="caller_key_1",
+            )
+            self.assertTrue(created_3)
+            self.assertFalse(created_4)
+            self.assertEqual(j3.job_id, j4.job_id)
+            self.assertNotEqual(j1.job_id, j3.job_id)
 
 
 if __name__ == "__main__":

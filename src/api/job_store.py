@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from src.api.outbound_orchestration import (
     CallPolicySnapshot,
-    JobEvent,
     JobAttempt,
+    JobEvent,
     JobState,
     OutboundCallJob,
     OutboundCallPayload,
@@ -21,30 +21,32 @@ from src.api.outbound_orchestration import (
     lease_job,
     move_retry_to_queue,
     parse_iso_utc,
+    reclaim_expired_lease,
     start_job_attempt,
     to_iso_utc,
     transition_state,
 )
+from src.api.storage_utils import atomic_write_json, validate_safe_id
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
-def _job_to_row(job: OutboundCallJob) -> Dict[str, Any]:
+def _job_to_row(job: OutboundCallJob) -> dict[str, Any]:
     row = asdict(job)
     row["trigger_source"] = job.trigger_source.value
     row["state"] = job.state.value
     return row
 
 
-def _job_from_row(row: Dict[str, Any]) -> OutboundCallJob:
+def _job_from_row(row: dict[str, Any]) -> OutboundCallJob:
     payload_data = row.get("payload") or {}
     policy_data = row.get("policy") or {}
     retry_data = row.get("retry_policy") or {}
 
     attempts_data = row.get("attempts", []) or []
-    attempts: List[JobAttempt] = []
+    attempts: list[JobAttempt] = []
     for item in attempts_data:
         if not isinstance(item, dict):
             continue
@@ -111,7 +113,8 @@ class JsonJobStore:
         return f"job_{uuid.uuid4().hex}"
 
     def _path_for(self, job_id: str) -> Path:
-        return self.root_dir / f"{job_id}.json"
+        safe_id = validate_safe_id(job_id, label="job_id")
+        return self.root_dir / f"{safe_id}.json"
 
     def enqueue_job(
         self,
@@ -120,10 +123,11 @@ class JsonJobStore:
         campaign_id: str,
         payload: OutboundCallPayload,
         policy: CallPolicySnapshot,
-        scheduled_for_utc: Optional[str] = None,
+        scheduled_for_utc: str | None = None,
         priority: int = 100,
-        retry_policy: Optional[RetryPolicy] = None,
-    ) -> Tuple[OutboundCallJob, bool]:
+        retry_policy: RetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[OutboundCallJob, bool]:
         with self._lock:
             new_job = create_job(
                 job_id=self.generate_job_id(),
@@ -134,6 +138,7 @@ class JsonJobStore:
                 scheduled_for_utc=scheduled_for_utc,
                 priority=priority,
                 retry_policy=retry_policy,
+                idempotency_key=idempotency_key,
             )
             existing = self._find_by_idempotency_locked(new_job.idempotency_key)
             if existing is not None:
@@ -146,15 +151,15 @@ class JsonJobStore:
             path = self._path_for(job_id)
             if not path.exists():
                 raise FileNotFoundError(f"Unknown job_id: {job_id}")
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 return _job_from_row(json.load(f))
 
     def list_jobs(
         self,
         *,
-        state: Optional[JobState] = None,
-        campaign_id: Optional[str] = None,
-    ) -> List[OutboundCallJob]:
+        state: JobState | None = None,
+        campaign_id: str | None = None,
+    ) -> list[OutboundCallJob]:
         with self._lock:
             jobs = self._load_all_locked()
             if state is not None:
@@ -164,7 +169,7 @@ class JsonJobStore:
             jobs.sort(key=lambda j: (j.priority, j.created_at_utc))
             return jobs
 
-    def requeue_due_retries(self, *, now_utc: Optional[datetime] = None) -> int:
+    def requeue_due_retries(self, *, now_utc: datetime | None = None) -> int:
         now = now_utc or _utc_now()
         changed = 0
         with self._lock:
@@ -180,20 +185,33 @@ class JsonJobStore:
                 changed += 1
         return changed
 
+    def reclaim_expired_leases(self, *, now_utc: datetime | None = None) -> int:
+        now = now_utc or _utc_now()
+        reclaimed = 0
+        with self._lock:
+            jobs = self._load_all_locked()
+            for job in jobs:
+                if reclaim_expired_lease(job, now_utc=now):
+                    self._write_locked(job)
+                    reclaimed += 1
+        return reclaimed
+
     def lease_next_due_job(
         self,
         *,
         worker_id: str,
         lease_seconds: int = 90,
-        now_utc: Optional[datetime] = None,
-    ) -> Optional[OutboundCallJob]:
+        now_utc: datetime | None = None,
+    ) -> OutboundCallJob | None:
         now = now_utc or _utc_now()
         with self._lock:
             jobs = self._load_all_locked()
 
-            # First, auto-requeue any waiting retries that are now due.
+            # Reclaim expired leases and auto-requeue due waiting retries before selection.
             for job in jobs:
-                if job.state == JobState.WAITING_RETRY:
+                if reclaim_expired_lease(job, now_utc=now):
+                    self._write_locked(job)
+                elif job.state == JobState.WAITING_RETRY:
                     try:
                         move_retry_to_queue(job, now_utc=now)
                     except ValueError:
@@ -214,7 +232,7 @@ class JsonJobStore:
             self._write_locked(selected)
             return selected
 
-    def mark_job_started(self, job_id: str, *, now_utc: Optional[datetime] = None) -> OutboundCallJob:
+    def mark_job_started(self, job_id: str, *, now_utc: datetime | None = None) -> OutboundCallJob:
         now = now_utc or _utc_now()
         with self._lock:
             job = self._read_locked(job_id)
@@ -228,7 +246,7 @@ class JsonJobStore:
         *,
         error_code: str,
         delay_seconds: int,
-        now_utc: Optional[datetime] = None,
+        now_utc: datetime | None = None,
     ) -> OutboundCallJob:
         now = now_utc or _utc_now()
         with self._lock:
@@ -248,7 +266,7 @@ class JsonJobStore:
         job_id: str,
         *,
         reason_code: str,
-        now_utc: Optional[datetime] = None,
+        now_utc: datetime | None = None,
     ) -> OutboundCallJob:
         _ = now_utc or _utc_now()
         with self._lock:
@@ -265,8 +283,8 @@ class JsonJobStore:
         job_id: str,
         *,
         outcome_code: str,
-        call_id: Optional[str] = None,
-        now_utc: Optional[datetime] = None,
+        call_id: str | None = None,
+        now_utc: datetime | None = None,
     ) -> OutboundCallJob:
         now = now_utc or _utc_now()
         with self._lock:
@@ -282,8 +300,8 @@ class JsonJobStore:
         job_id: str,
         *,
         error_code: str,
-        call_id: Optional[str] = None,
-        now_utc: Optional[datetime] = None,
+        call_id: str | None = None,
+        now_utc: datetime | None = None,
     ) -> OutboundCallJob:
         now = now_utc or _utc_now()
         with self._lock:
@@ -294,17 +312,17 @@ class JsonJobStore:
             self._write_locked(job)
             return job
 
-    def _find_by_idempotency_locked(self, idempotency_key: str) -> Optional[OutboundCallJob]:
+    def _find_by_idempotency_locked(self, idempotency_key: str) -> OutboundCallJob | None:
         for job in self._load_all_locked():
             if job.idempotency_key == idempotency_key:
                 return job
         return None
 
-    def _load_all_locked(self) -> List[OutboundCallJob]:
-        jobs: List[OutboundCallJob] = []
+    def _load_all_locked(self) -> list[OutboundCallJob]:
+        jobs: list[OutboundCallJob] = []
         for path in sorted(self.root_dir.glob("*.json")):
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     row = json.load(f)
                 jobs.append(_job_from_row(row))
             except Exception:
@@ -315,10 +333,9 @@ class JsonJobStore:
         path = self._path_for(job_id)
         if not path.exists():
             raise FileNotFoundError(f"Unknown job_id: {job_id}")
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return _job_from_row(json.load(f))
 
     def _write_locked(self, job: OutboundCallJob) -> None:
         path = self._path_for(job.job_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(_job_to_row(job), f, indent=2)
+        atomic_write_json(path, _job_to_row(job))

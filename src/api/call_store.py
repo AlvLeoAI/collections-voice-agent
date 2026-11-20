@@ -2,27 +2,34 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any
 
+from src.api.storage_utils import atomic_write_json, validate_safe_id
 from src.outbound_voice_agent import CallState
 from src.outbound_voice_agent.agent import TurnEvent
 
 
+def _sanitize_call_state(call_state: CallState) -> dict[str, Any]:
+    data = call_state.model_dump(mode="json")
+    data["last_user_utterance"] = ""
+    return data
+
+
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
-def _extract_outcome_code(actions: List[Dict[str, Any]]) -> Optional[str]:
+def _extract_outcome_code(actions: list[dict[str, Any]]) -> str | None:
     for action in actions:
         if action.get("action") == "set_outcome":
             return action.get("outcome_code")
     return None
 
 
-def _extract_end_reason(actions: List[Dict[str, Any]]) -> Optional[str]:
+def _extract_end_reason(actions: list[dict[str, Any]]) -> str | None:
     for action in actions:
         if action.get("action") == "end_call":
             return action.get("reason")
@@ -41,7 +48,8 @@ class JsonCallStore:
         return uuid.uuid4().hex
 
     def _path_for(self, call_id: str) -> Path:
-        return self.root_dir / f"{call_id}.json"
+        safe_id = validate_safe_id(call_id, label="call_id")
+        return self.root_dir / f"{safe_id}.json"
 
     def create_call(
         self,
@@ -49,29 +57,32 @@ class JsonCallStore:
         call_id: str,
         assistant_intent: str,
         call_state: CallState,
-    ) -> Dict[str, Any]:
-        now = _utc_now_iso()
-        record = {
-            "call_id": call_id,
-            "status": "active",
-            "created_at_utc": now,
-            "updated_at_utc": now,
-            "turns": [
-                {
-                    "turn_index": 1,
-                    "timestamp_utc": now,
-                    "recorded_at_utc": now,
-                    "event_type": "system_start",
-                    "assistant_intent": assistant_intent,
-                    "actions": [],
-                }
-            ],
-            "final_outcome_code": None,
-            "final_end_reason": None,
-            "last_call_state": call_state.model_dump(mode="json"),
-        }
-        self._write_record(record)
-        return record
+        account_ref: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            now = _utc_now_iso()
+            record = {
+                "call_id": validate_safe_id(call_id, label="call_id"),
+                "account_ref": account_ref,
+                "status": "active",
+                "created_at_utc": now,
+                "updated_at_utc": now,
+                "turns": [
+                    {
+                        "turn_index": 1,
+                        "timestamp_utc": now,
+                        "recorded_at_utc": now,
+                        "event_type": "system_start",
+                        "assistant_intent": assistant_intent,
+                        "actions": [],
+                    }
+                ],
+                "final_outcome_code": None,
+                "final_end_reason": None,
+                "last_call_state": _sanitize_call_state(call_state),
+            }
+            self._write_record(record)
+            return record
 
     def append_turn(
         self,
@@ -79,10 +90,10 @@ class JsonCallStore:
         call_id: str,
         turn_event: TurnEvent,
         assistant_intent: str,
-        actions: List[Dict[str, Any]],
+        actions: list[dict[str, Any]],
         call_state: CallState,
-        nlu: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        nlu: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             record = self._read_record(call_id)
             now = _utc_now_iso()
@@ -100,7 +111,7 @@ class JsonCallStore:
             }
             record["turns"].append(turn_row)
             record["updated_at_utc"] = now
-            record["last_call_state"] = call_state.model_dump(mode="json")
+            record["last_call_state"] = _sanitize_call_state(call_state)
 
             if call_state.phase == "ended":
                 record["status"] = "ended"
@@ -117,7 +128,7 @@ class JsonCallStore:
             self._write_record(record)
             return record
 
-    def get_call(self, call_id: str) -> Dict[str, Any]:
+    def get_call(self, call_id: str) -> dict[str, Any]:
         with self._lock:
             return self._read_record(call_id)
 
@@ -125,12 +136,12 @@ class JsonCallStore:
         record = self.get_call(call_id)
         return CallState.model_validate(record.get("last_call_state", {}))
 
-    def list_calls(self) -> List[Dict[str, Any]]:
+    def list_calls(self) -> list[dict[str, Any]]:
         with self._lock:
-            records: List[Dict[str, Any]] = []
+            records: list[dict[str, Any]] = []
             for path in sorted(self.root_dir.glob("*.json")):
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(path, encoding="utf-8") as f:
                         item = json.load(f)
                     if isinstance(item, dict):
                         records.append(item)
@@ -139,12 +150,13 @@ class JsonCallStore:
                     continue
             return records
 
-    def summarize_call(self, call_id: str) -> Dict[str, Any]:
+    def summarize_call(self, call_id: str) -> dict[str, Any]:
         record = self.get_call(call_id)
         turns = record.get("turns", [])
         last_turn = turns[-1] if turns else {}
         return {
             "call_id": record.get("call_id"),
+            "account_ref": record.get("account_ref"),
             "status": record.get("status"),
             "created_at_utc": record.get("created_at_utc"),
             "updated_at_utc": record.get("updated_at_utc"),
@@ -156,14 +168,13 @@ class JsonCallStore:
             "turns": turns,
         }
 
-    def _read_record(self, call_id: str) -> Dict[str, Any]:
+    def _read_record(self, call_id: str) -> dict[str, Any]:
         path = self._path_for(call_id)
         if not path.exists():
             raise FileNotFoundError(f"Unknown call_id: {call_id}")
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
 
-    def _write_record(self, record: Dict[str, Any]) -> None:
+    def _write_record(self, record: dict[str, Any]) -> None:
         path = self._path_for(str(record["call_id"]))
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2)
+        atomic_write_json(path, record)

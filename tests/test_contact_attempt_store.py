@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from zoneinfo import ZoneInfoNotFoundError
 
 from src.api.contact_attempt_store import JsonContactAttemptStore
 
@@ -59,6 +60,49 @@ class ContactAttemptStoreTests(unittest.TestCase):
             recent = store.list_recent_events(limit=10)
             self.assertEqual(len(recent), 2)
             self.assertEqual(recent[0]["decision_code"], "blocked_suppression_dnc")
+
+    def test_set_and_get_suppressions_records_audit_event(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonContactAttemptStore(root_dir=tmpdir)
+            self.assertEqual(
+                store.get_suppressions("acct_sup"),
+                {"dnc": False, "cease_contact": False, "legal_hold": False},
+            )
+            event = store.set_suppression(
+                account_ref="acct_sup",
+                flag="cease_contact",
+                reason="in_call_stop_request",
+                call_id="call_42",
+            )
+            self.assertEqual(event["decision_code"], "suppression_recorded_cease_contact")
+            self.assertFalse(event["counts_toward_attempt"])
+            self.assertEqual(event["reason"], "in_call_stop_request")
+            self.assertEqual(event["call_id"], "call_42")
+
+            suppressions = store.get_suppressions("acct_sup")
+            self.assertTrue(suppressions["cease_contact"])
+            self.assertFalse(suppressions["dnc"])
+            self.assertFalse(suppressions["legal_hold"])
+
+            events = store.list_events("acct_sup")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["decision_code"], "suppression_recorded_cease_contact")
+
+    def test_set_suppression_rejects_invalid_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonContactAttemptStore(root_dir=tmpdir)
+            with self.assertRaises(ValueError):
+                store.set_suppression(account_ref="acct_bad", flag="unknown_flag", reason="test")
+
+    def test_count_attempts_invalid_timezone_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonContactAttemptStore(root_dir=tmpdir)
+            with self.assertRaises((ZoneInfoNotFoundError, ValueError)):
+                store.count_attempts_for_local_day(
+                    account_ref="acct_tz",
+                    timezone_name="America/Chicagoo",
+                    local_day_iso="2026-02-08",
+                )
 
 
 if __name__ == "__main__":

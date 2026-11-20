@@ -1,12 +1,12 @@
-from dataclasses import asdict
-from typing import Any, Dict, List, Literal, Optional
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Literal
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 # Load environment variables
 load_dotenv()
@@ -15,58 +15,64 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.outbound_voice_agent import CallState, handle_turn, start_call
-from src.outbound_voice_agent.agent import TurnEvent
-from src.api.call_store import JsonCallStore
-from src.api.contact_attempt_store import JsonContactAttemptStore
-from src.api.job_store import JsonJobStore
-from src.api.metrics import build_job_metrics_summary, build_metrics_summary
-from src.api.outbound_orchestration import (
+from src.api.call_store import JsonCallStore  # noqa: E402
+from src.api.contact_attempt_store import JsonContactAttemptStore  # noqa: E402
+from src.api.job_store import JsonJobStore  # noqa: E402
+from src.api.metrics import build_job_metrics_summary, build_metrics_summary  # noqa: E402
+from src.api.outbound_orchestration import (  # noqa: E402
     CallPolicySnapshot,
     JobState,
     OutboundCallPayload,
     RetryPolicy,
     TriggerSource,
 )
+from src.api.storage_utils import InvalidIdError  # noqa: E402
+from src.outbound_voice_agent import CallState, handle_turn, start_call  # noqa: E402
+from src.outbound_voice_agent.agent import TurnEvent  # noqa: E402
+
+RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "runtime"))
 
 app = FastAPI(title="Outbound Agent API")
-call_store = JsonCallStore()
-job_store = JsonJobStore()
-attempt_store = JsonContactAttemptStore()
+call_store = JsonCallStore(root_dir=RUNTIME_DIR / "calls")
+job_store = JsonJobStore(root_dir=RUNTIME_DIR / "jobs")
+attempt_store = JsonContactAttemptStore(root_dir=RUNTIME_DIR / "attempts")
 
 
 class StartCallRequest(BaseModel):
-    party_profile: Dict[str, Any]
+    party_profile: dict[str, Any]
+    account_ref: str | None = None
 
 
 class TurnRequest(BaseModel):
     call_id: str
-    turn_event: Dict[str, Any]
-    call_state: Optional[CallState] = None
-    party_profile: Dict[str, Any]
-    account_context: Dict[str, Any]
-    policy_config: Dict[str, Any]
+    turn_event: dict[str, Any]
+    call_state: CallState | None = None
+    party_profile: dict[str, Any]
+    account_context: dict[str, Any]
+    policy_config: dict[str, Any]
+    account_ref: str | None = None
 
 
 class EnqueueJobRequest(BaseModel):
     trigger_source: Literal["cron", "webhook", "manual"] = "manual"
     campaign_id: str
     account_ref: str
-    party_profile: Dict[str, str]
+    party_profile: dict[str, str]
     account_context_ref: str
     language: str = "en-US"
     dnc: bool = False
     cease_contact: bool = False
     legal_hold: bool = False
     timezone: str = "America/Chicago"
-    allowed_local_time_ranges: List[str] = Field(default_factory=lambda: ["08:00-20:00"])
+    allowed_local_time_ranges: list[str] = Field(default_factory=lambda: ["08:00-20:00"])
     daily_attempt_cap: int = 2
     min_gap_minutes: int = 60
-    scheduled_for_utc: Optional[str] = None
+    scheduled_for_utc: str | None = None
     priority: int = 100
     max_attempts: int = 3
     base_delay_seconds: int = 120
     max_delay_seconds: int = 3600
+    idempotency_key: str | None = None
 
 
 class LeaseJobRequest(BaseModel):
@@ -76,19 +82,28 @@ class LeaseJobRequest(BaseModel):
 
 class CompleteJobRequest(BaseModel):
     outcome_code: str
-    call_id: Optional[str] = None
+    call_id: str | None = None
 
 
 class FailJobRequest(BaseModel):
     error_code: str
-    call_id: Optional[str] = None
+    call_id: str | None = None
 
 
-def _serialize_job(job: Any) -> Dict[str, Any]:
+def _serialize_job(job: Any) -> dict[str, Any]:
     row = asdict(job)
     row["trigger_source"] = job.trigger_source.value
     row["state"] = job.state.value
     return row
+
+
+@app.get("/health")
+async def api_health():
+    return {
+        "status": "ok",
+        "service": "collections-voice-agent",
+        "llm_in_core_path": False,
+    }
 
 
 @app.post("/call/start")
@@ -102,6 +117,7 @@ async def api_start_call(request: StartCallRequest):
             call_id=call_id,
             assistant_intent=result["assistant_intent"],
             call_state=result["call_state"],
+            account_ref=request.account_ref,
         )
 
         return {
@@ -114,21 +130,24 @@ async def api_start_call(request: StartCallRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/call/turn")
 async def api_handle_turn(request: TurnRequest):
     try:
         try:
-            state = call_store.get_call_state(request.call_id)
+            record = call_store.get_call(request.call_id)
+            state = CallState.model_validate(record.get("last_call_state", {}))
+        except InvalidIdError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except FileNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            raise HTTPException(status_code=404, detail=str(e)) from e
 
         try:
             event = TurnEvent(**request.turn_event)
         except TypeError as e:
-            raise HTTPException(status_code=422, detail=f"Invalid turn_event payload: {e}")
+            raise HTTPException(status_code=422, detail=f"Invalid turn_event payload: {e}") from e
 
         result = handle_turn(
             turn_event=event,
@@ -147,18 +166,32 @@ async def api_handle_turn(request: TurnRequest):
             nlu=result.get("nlu"),
         )
 
+        actions = result.get("actions", [])
+        if result["assistant_intent"] != "already_closed" and (
+            result["call_state"].cease_contact_requested
+            or any(action.get("action") == "mark_do_not_contact" for action in actions)
+        ):
+            account_ref = request.account_ref or record.get("account_ref")
+            if account_ref:
+                attempt_store.set_suppression(
+                    account_ref=account_ref,
+                    flag="cease_contact",
+                    reason="in_call_stop_request",
+                    call_id=request.call_id,
+                )
+
         return {
             "call_id": request.call_id,
             "assistant_text": result["assistant_text"],
             "assistant_intent": result["assistant_intent"],
-            "actions": result["actions"],
+            "actions": actions,
             "nlu": result.get("nlu"),
             "call_state": result["call_state"].model_dump(mode="json"),
         }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/call/{call_id}")
@@ -167,8 +200,10 @@ async def api_get_call_summary(call_id: str):
         return call_store.summarize_call(call_id)
     except HTTPException:
         raise
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 @app.get("/metrics/summary")
@@ -182,7 +217,7 @@ async def api_get_metrics_summary():
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/jobs/enqueue")
@@ -219,24 +254,27 @@ async def api_enqueue_job(request: EnqueueJobRequest):
             scheduled_for_utc=request.scheduled_for_utc,
             priority=request.priority,
             retry_policy=retry_policy,
+            idempotency_key=request.idempotency_key,
         )
         return {"created": created, "job": _serialize_job(job)}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/jobs")
-async def api_list_jobs(state: Optional[str] = None, campaign_id: Optional[str] = None, limit: int = 50):
+async def api_list_jobs(state: str | None = None, campaign_id: str | None = None, limit: int = 50):
     try:
-        state_filter: Optional[JobState] = None
+        state_filter: JobState | None = None
         if state:
             try:
                 state_filter = JobState(state)
-            except ValueError:
+            except ValueError as e:
                 valid = ", ".join(s.value for s in JobState)
-                raise HTTPException(status_code=422, detail=f"Invalid state '{state}'. Valid values: {valid}")
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid state '{state}'. Valid values: {valid}"
+                ) from e
 
         jobs = job_store.list_jobs(state=state_filter, campaign_id=campaign_id)
         if limit > 0:
@@ -245,7 +283,7 @@ async def api_list_jobs(state: Optional[str] = None, campaign_id: Optional[str] 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/jobs/{job_id}")
@@ -254,10 +292,12 @@ async def api_get_job(job_id: str):
         return _serialize_job(job_store.get_job(job_id))
     except HTTPException:
         raise
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/jobs/lease")
@@ -271,7 +311,7 @@ async def api_lease_job(request: LeaseJobRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/jobs/{job_id}/start")
@@ -280,12 +320,14 @@ async def api_start_job_attempt(job_id: str):
         return _serialize_job(job_store.mark_job_started(job_id))
     except HTTPException:
         raise
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/jobs/{job_id}/success")
@@ -300,12 +342,14 @@ async def api_complete_job(job_id: str, request: CompleteJobRequest):
         )
     except HTTPException:
         raise
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/jobs/{job_id}/failure")
@@ -320,12 +364,14 @@ async def api_fail_job(job_id: str, request: FailJobRequest):
         )
     except HTTPException:
         raise
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/attempts/{account_ref}")
@@ -335,7 +381,7 @@ async def api_get_attempts_for_account(account_ref: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/attempts")
@@ -345,7 +391,7 @@ async def api_get_recent_attempts(limit: int = 200):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 if __name__ == "__main__":

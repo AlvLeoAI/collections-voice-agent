@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from src.api.outbound_orchestration import (
     CallPolicySnapshot,
@@ -13,6 +13,7 @@ from src.api.outbound_orchestration import (
     create_job,
     lease_job,
     move_retry_to_queue,
+    reclaim_expired_lease,
     start_job_attempt,
     transition_state,
 )
@@ -53,13 +54,13 @@ class OutboundOrchestrationTests(unittest.TestCase):
         self.assertEqual(job.state, JobState.RUNNING)
         self.assertEqual(len(job.attempts), 1)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         job.mark_succeeded(now_utc=now, outcome_code="ptp_set")
         self.assertEqual(job.state, JobState.SUCCEEDED)
         self.assertEqual(job.attempts[0].outcome_code, "ptp_set")
 
     def test_failure_then_retry_then_queue(self):
-        now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
         job = create_job(
             job_id="job_002",
             trigger_source=TriggerSource.WEBHOOK,
@@ -82,7 +83,7 @@ class OutboundOrchestrationTests(unittest.TestCase):
         self.assertEqual(job.state, JobState.QUEUED)
 
     def test_exhaust_retries_dead_letters_job(self):
-        now = datetime(2026, 2, 8, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
         job = create_job(
             job_id="job_003",
             trigger_source=TriggerSource.CRON,
@@ -123,6 +124,55 @@ class OutboundOrchestrationTests(unittest.TestCase):
             transition_state(JobState.LEASED, JobEvent.SCHEDULE_RETRY),
             JobState.WAITING_RETRY,
         )
+
+    def test_lease_expired_transition_and_reclaim_expired_lease(self):
+        self.assertEqual(
+            transition_state(JobState.LEASED, JobEvent.LEASE_EXPIRED),
+            JobState.QUEUED,
+        )
+        now = datetime(2026, 2, 8, 12, 0, tzinfo=UTC)
+        job = create_job(
+            job_id="job_reclaim",
+            trigger_source=TriggerSource.MANUAL,
+            campaign_id="cmp_reclaim",
+            payload=self._sample_payload(),
+            policy=self._sample_policy(),
+        )
+        lease_job(job, worker_id="worker_1", lease_seconds=60, now_utc=now)
+        self.assertFalse(reclaim_expired_lease(job, now_utc=now + timedelta(seconds=30)))
+        self.assertEqual(job.state, JobState.LEASED)
+
+        self.assertTrue(reclaim_expired_lease(job, now_utc=now + timedelta(seconds=61)))
+        self.assertEqual(job.state, JobState.QUEUED)
+        self.assertIsNone(job.lease_owner)
+        self.assertIsNone(job.lease_expires_at_utc)
+
+    def test_create_job_deterministic_idempotency_without_scheduled_for_utc_and_custom_key(self):
+        job_a = create_job(
+            job_id="job_a",
+            trigger_source=TriggerSource.MANUAL,
+            campaign_id="cmp_idem",
+            payload=self._sample_payload(),
+            policy=self._sample_policy(),
+        )
+        job_b = create_job(
+            job_id="job_b",
+            trigger_source=TriggerSource.WEBHOOK,
+            campaign_id="cmp_idem",
+            payload=self._sample_payload(),
+            policy=self._sample_policy(),
+        )
+        self.assertEqual(job_a.idempotency_key, job_b.idempotency_key)
+
+        custom = create_job(
+            job_id="job_c",
+            trigger_source=TriggerSource.MANUAL,
+            campaign_id="cmp_idem",
+            payload=self._sample_payload(),
+            policy=self._sample_policy(),
+            idempotency_key="custom-idem-key-1",
+        )
+        self.assertEqual(custom.idempotency_key, "custom-idem-key-1")
 
 
 if __name__ == "__main__":

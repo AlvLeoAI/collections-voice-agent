@@ -4,22 +4,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
-import httpx
-from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
+import os
 
 # Ensure project root is on sys.path when running from ./scripts
 import sys
+import tempfile
+from contextlib import nullcontext
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def default_context() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def default_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     party_profile = {
         "target_name": "Alex Morgan",
         "target_preferred_name": "Alex",
@@ -62,8 +65,8 @@ def default_context() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     return party_profile, account_context, policy_config
 
 
-def scenario_events(name: str) -> List[Dict[str, Any]]:
-    scenarios: Dict[str, List[Dict[str, Any]]] = {
+def scenario_events(name: str) -> list[dict[str, Any]]:
+    scenarios: dict[str, list[dict[str, Any]]] = {
         "happy_path": [
             {"event_type": "user_utterance", "transcript": "This is Alex Morgan."},
             {"event_type": "user_utterance", "transcript": "78701."},
@@ -81,10 +84,10 @@ def scenario_events(name: str) -> List[Dict[str, Any]]:
     return scenarios[name]
 
 
-def build_turn_event(event: Dict[str, Any], tz_name: str, language: str) -> Dict[str, Any]:
+def build_turn_event(event: dict[str, Any], tz_name: str, language: str) -> dict[str, Any]:
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz)
-    now_utc = now_local.astimezone(timezone.utc)
+    now_utc = now_local.astimezone(UTC)
     return {
         "event_type": event["event_type"],
         "transcript": event.get("transcript"),
@@ -105,44 +108,64 @@ def main() -> int:
     parser.add_argument("--scenario", choices=["happy_path", "wrong_party", "dispute"], default="happy_path")
     parser.add_argument("--timezone", default="America/Chicago")
     parser.add_argument("--language", default="en-US")
+    parser.add_argument("--calls-dir", default=None, help="Optional override for calls directory (inprocess mode only)")
+    parser.add_argument(
+        "--temp-runtime",
+        action="store_true",
+        help="Use a temporary runtime directory so runtime/calls/ is not modified (inprocess mode only)",
+    )
     parser.add_argument("--print-summary-json", action="store_true")
     args = parser.parse_args()
 
     party_profile, account_context, policy_config = default_context()
     events = scenario_events(args.scenario)
 
+    persisted_dir = Path(args.calls_dir) if args.calls_dir else Path("runtime/calls")
+
     if args.mode == "inprocess":
-        from src.api.server import (
-            StartCallRequest,
-            TurnRequest,
-            api_get_call_summary,
-            api_handle_turn,
-            api_start_call,
-        )
+        temp_ctx = tempfile.TemporaryDirectory() if args.temp_runtime else nullcontext(None)
+        with temp_ctx as tmp_runtime:
+            if tmp_runtime is not None:
+                os.environ["RUNTIME_DIR"] = tmp_runtime
+                persisted_dir = Path(args.calls_dir) if args.calls_dir else (Path(tmp_runtime) / "calls")
 
-        start_data = asyncio.run(api_start_call(StartCallRequest(party_profile=party_profile)))
-        call_id = start_data["call_id"]
-        call_state = start_data["call_state"]
-        print(f"call_id={call_id}")
-        print(f"assistant(start)={start_data['assistant_intent']} | {start_data['assistant_text']}")
-
-        for idx, event in enumerate(events, start=1):
-            payload = TurnRequest(
-                call_id=call_id,
-                turn_event=build_turn_event(event, args.timezone, args.language),
-                call_state=call_state,
-                party_profile=party_profile,
-                account_context=account_context,
-                policy_config=policy_config,
+            from src.api import server
+            from src.api.call_store import JsonCallStore
+            from src.api.server import (
+                StartCallRequest,
+                TurnRequest,
+                api_get_call_summary,
+                api_handle_turn,
+                api_start_call,
             )
-            turn_data = asyncio.run(api_handle_turn(payload))
-            call_state = turn_data["call_state"]
-            print(f"assistant(turn {idx})={turn_data['assistant_intent']} | {turn_data['assistant_text']}")
-            print(f"actions(turn {idx})={turn_data.get('actions', [])}")
-            if call_state.get("phase") == "ended":
-                break
 
-        summary = asyncio.run(api_get_call_summary(call_id))
+            if args.calls_dir or tmp_runtime is not None:
+                server.call_store = JsonCallStore(root_dir=persisted_dir)
+
+            start_data = asyncio.run(api_start_call(StartCallRequest(party_profile=party_profile)))
+            call_id = start_data["call_id"]
+            call_state = start_data["call_state"]
+            print(f"call_id={call_id}")
+            print(f"assistant(start)={start_data['assistant_intent']} | {start_data['assistant_text']}")
+
+            for idx, event in enumerate(events, start=1):
+                payload = TurnRequest(
+                    call_id=call_id,
+                    turn_event=build_turn_event(event, args.timezone, args.language),
+                    call_state=call_state,
+                    party_profile=party_profile,
+                    account_context=account_context,
+                    policy_config=policy_config,
+                )
+                turn_data = asyncio.run(api_handle_turn(payload))
+                call_state = turn_data["call_state"]
+                print(f"assistant(turn {idx})={turn_data['assistant_intent']} | {turn_data['assistant_text']}")
+                print(f"actions(turn {idx})={turn_data.get('actions', [])}")
+                if call_state.get("phase") == "ended":
+                    break
+
+            summary = asyncio.run(api_get_call_summary(call_id))
+            persisted_label = "(temporary runtime cleaned up)" if tmp_runtime is not None and not args.calls_dir else str(persisted_dir / f"{call_id}.json")
     else:
         with httpx.Client(timeout=30.0) as client:
             start_resp = client.post(f"{args.base_url}/call/start", json={"party_profile": party_profile})
@@ -182,6 +205,7 @@ def main() -> int:
                 print(f"ERROR /call/{{call_id}} [{summary_resp.status_code}]: {summary_resp.text}")
                 return 1
             summary = summary_resp.json()
+            persisted_label = f"runtime/calls/{call_id}.json"
 
     print(
         "summary:",
@@ -190,7 +214,7 @@ def main() -> int:
         f"final_outcome_code={summary.get('final_outcome_code')},",
         f"final_end_reason={summary.get('final_end_reason')}",
     )
-    print(f"persisted_file=runtime/calls/{call_id}.json")
+    print(f"persisted_file={persisted_label}")
 
     if args.print_summary_json:
         print(json.dumps(summary, indent=2))

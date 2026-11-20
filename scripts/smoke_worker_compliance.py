@@ -3,21 +3,20 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import tempfile
-from dataclasses import asdict
-from pathlib import Path
-from typing import List, Tuple
 
 # Ensure project root is on sys.path when running from ./scripts
 import sys
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.api.contact_attempt_store import JsonContactAttemptStore
-from src.api.job_store import JsonJobStore
-from src.api.metrics import build_job_metrics_summary
-from src.api.outbound_orchestration import CallPolicySnapshot, OutboundCallPayload, TriggerSource
+from src.api.contact_attempt_store import JsonContactAttemptStore  # noqa: E402
+from src.api.job_store import JsonJobStore  # noqa: E402
+from src.api.metrics import build_job_metrics_summary  # noqa: E402
+from src.api.outbound_orchestration import CallPolicySnapshot, OutboundCallPayload, TriggerSource  # noqa: E402
 
 
 def _run_worker_once(
@@ -26,7 +25,7 @@ def _run_worker_once(
     calls_dir: str,
     attempts_dir: str,
     worker_id: str,
-) -> Tuple[int, str, str]:
+) -> tuple[int, str, str]:
     cmd = [
         sys.executable,
         "scripts/run_outbound_worker.py",
@@ -44,7 +43,7 @@ def _run_worker_once(
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def _serialize_jobs_for_metrics(store: JsonJobStore) -> List[dict]:
+def _serialize_jobs_for_metrics(store: JsonJobStore) -> list[dict]:
     rows = []
     for job in store.list_jobs():
         row = asdict(job)
@@ -132,7 +131,7 @@ def run_smoke(
     allow_events = attempts_store.list_events("acct_smoke_allow_001")
     dnc_events = attempts_store.list_events("acct_smoke_dnc_001")
 
-    errors: List[str] = []
+    errors: list[str] = []
     if allow.state.value != "succeeded":
         errors.append(f"allowed job state expected=succeeded actual={allow.state.value}")
     if len(allow.attempts) != 1:

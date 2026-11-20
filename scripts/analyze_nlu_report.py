@@ -5,16 +5,16 @@ import argparse
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 
-def load_call_records(calls_dir: Path) -> List[Dict[str, Any]]:
+def load_call_records(calls_dir: Path) -> list[dict[str, Any]]:
     if not calls_dir.exists():
         return []
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for path in sorted(calls_dir.glob("*.json")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 records.append(json.load(f))
         except Exception:
             # Keep report generation robust to partial/corrupt files.
@@ -22,13 +22,13 @@ def load_call_records(calls_dir: Path) -> List[Dict[str, Any]]:
     return records
 
 
-def build_report(records: List[Dict[str, Any]], *, low_confidence_threshold: float) -> Dict[str, Any]:
+def build_report(records: list[dict[str, Any]], *, low_confidence_threshold: float) -> dict[str, Any]:
     status_counts = Counter()
     outcome_counts = Counter()
     nlu_intent_counts = Counter()
     assistant_intent_counts = Counter()
     low_confidence_counts = Counter()
-    intent_to_assistant: Dict[str, Counter] = defaultdict(Counter)
+    intent_to_assistant: dict[str, Counter] = defaultdict(Counter)
 
     total_turns = 0
     turns_with_nlu = 0
@@ -71,12 +71,12 @@ def build_report(records: List[Dict[str, Any]], *, low_confidence_threshold: flo
     }
 
 
-def _top_keys(counter_like: Dict[str, int], limit: int) -> List[str]:
+def _top_keys(counter_like: dict[str, int], limit: int) -> list[str]:
     pairs = sorted(counter_like.items(), key=lambda x: (-x[1], x[0]))
     return [k for k, _ in pairs[:limit]]
 
 
-def _format_two_col_table(rows: List[Tuple[str, str]], *, left_label: str, right_label: str) -> str:
+def _format_two_col_table(rows: list[tuple[str, str]], *, left_label: str, right_label: str) -> str:
     left_w = max([len(left_label)] + [len(r[0]) for r in rows]) if rows else len(left_label)
     right_w = max([len(right_label)] + [len(r[1]) for r in rows]) if rows else len(right_label)
     sep = f"+-{'-' * left_w}-+-{'-' * right_w}-+"
@@ -87,7 +87,7 @@ def _format_two_col_table(rows: List[Tuple[str, str]], *, left_label: str, right
     return "\n".join(out)
 
 
-def _format_matrix(matrix: Dict[str, Dict[str, int]], *, row_limit: int, col_limit: int) -> str:
+def _format_matrix(matrix: dict[str, dict[str, int]], *, row_limit: int, col_limit: int) -> str:
     if not matrix:
         return "(no NLU rows)"
 
@@ -119,8 +119,8 @@ def _format_matrix(matrix: Dict[str, Dict[str, int]], *, row_limit: int, col_lim
     return "\n".join(lines)
 
 
-def format_report(report: Dict[str, Any], *, top_n: int) -> str:
-    lines: List[str] = []
+def format_report(report: dict[str, Any], *, top_n: int) -> str:
+    lines: list[str] = []
     lines.append("NLU Report")
     lines.append(f"calls_total={report['calls_total']}")
     lines.append(f"turns_total={report['total_turns']}, turns_with_nlu={report['turns_with_nlu']}")
@@ -136,7 +136,7 @@ def format_report(report: Dict[str, Any], *, top_n: int) -> str:
     lines.append(_format_two_col_table(outcome_rows, left_label="outcome", right_label="count") if outcome_rows else "(no outcomes)")
     lines.append("")
 
-    intent_rows: List[Tuple[str, str]] = []
+    intent_rows: list[tuple[str, str]] = []
     intent_counts = report["nlu_intent_counts"]
     low_counts = report["low_confidence_counts"]
     threshold = float(report["low_confidence_threshold"])

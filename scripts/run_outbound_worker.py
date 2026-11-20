@@ -2,23 +2,22 @@
 from __future__ import annotations
 
 import argparse
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
 
 # Ensure project root is on sys.path when running from ./scripts
 import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.api.call_store import JsonCallStore
-from src.api.compliance import evaluate_pre_dial_gate
-from src.api.contact_attempt_store import JsonContactAttemptStore
-from src.api.job_store import JsonJobStore
-from src.api.outbound_orchestration import JobState
-from src.outbound_voice_agent import CallState, start_call
+from src.api.call_store import JsonCallStore  # noqa: E402
+from src.api.compliance import evaluate_pre_dial_gate  # noqa: E402
+from src.api.contact_attempt_store import JsonContactAttemptStore  # noqa: E402
+from src.api.job_store import JsonJobStore  # noqa: E402
+from src.api.outbound_orchestration import JobState  # noqa: E402
+from src.outbound_voice_agent import CallState, start_call  # noqa: E402
 
 
 def _process_one_job(
@@ -35,7 +34,7 @@ def _process_one_job(
 
     job_id = leased.job_id
     try:
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         decision = evaluate_pre_dial_gate(
             account_ref=leased.payload.account_ref,
             policy=leased.policy,
@@ -71,6 +70,7 @@ def _process_one_job(
             call_id=call_id,
             assistant_intent=result["assistant_intent"],
             call_state=result["call_state"],
+            account_ref=started.payload.account_ref,
         )
         job_store.mark_job_succeeded(job_id, outcome_code="call_initialized", call_id=call_id)
         attempt_store.append_event(
@@ -93,7 +93,7 @@ def _process_one_job(
         except Exception:
             pass
         try:
-            account_ref: Optional[str] = None
+            account_ref: str | None = None
             try:
                 account_ref = leased.payload.account_ref
             except Exception:
