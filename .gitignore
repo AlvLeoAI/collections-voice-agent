@@ -1,6 +1,3 @@
-# Agent guide (local only)
-AGENTS.md
-
 # Environment variables
 .env
 
@@ -8,10 +5,12 @@ AGENTS.md
 .venv/
 .venv_runtime/
 
-# Python cache
+# Python & tool caches
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.ruff_cache/
 
 # Runtime data (calls, jobs, attempts, temp audio)
 runtime/
