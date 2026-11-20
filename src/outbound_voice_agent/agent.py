@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 
 from .intent_classifier import (
@@ -15,6 +15,9 @@ from .state import CallState
 from .tools.date_normalizer import _last_day_of_month, normalize_datetime_local
 
 TurnEventType = Literal["user_utterance", "silence", "system_event"]
+
+# Pre-verification re-prompts ("Is that you?") allowed before the call is closed.
+MAX_TARGET_PROMPT_ATTEMPTS = 2
 
 @dataclass(frozen=True)
 class TurnEvent:
@@ -143,21 +146,46 @@ def _handle_pre_verification(turn_event, state, party_profile, account_context, 
         return _close_call(state, "My apologies, I must have the wrong number. I'll update my records.", "wrong_party")
 
     if nlu.matched("identity_question"):
+        if _target_prompt_limit_reached(state):
+            return _close_target_unconfirmed(state)
         # Policy: Introduce role but do not mention company or debt yet
         assistant_text = f"I am an automated assistant calling regarding a personal business matter for {target_name}. Is this them?"
         return _wrap_response(assistant_text, "request_target", [], state)
 
-    if nlu.matched("affirmation"):
+    # Conflicting yes/no answers are clarified before anything else is inferred from them.
+    if is_low_confidence_unknown(nlu):
+        return _handle_low_confidence(state, phase="pre_verification", party_profile=party_profile, policy_config=policy_config, account_context=account_context)
+
+    if nlu.matched("affirmation") and not nlu.matched("negation"):
         state.target_reached = "yes"
         state.phase = "verification"
         return _ask_verification_question(state, policy_config, user_text=transcript)
 
-    if is_low_confidence_unknown(nlu):
-        return _handle_low_confidence(state, phase="pre_verification", party_profile=party_profile, policy_config=policy_config, account_context=account_context)
+    # A plain "no" to "Is this them?" is a wrong-party answer: close instead of re-asking.
+    if nlu.matched("negation") and not nlu.matched("affirmation"):
+        state.wrong_party_indicated = True
+        state.target_reached = "no"
+        return _close_call(state, "My apologies, I must have the wrong number. I'll update my records.", "wrong_party")
 
-    # Re-prompt for target
+    # Re-prompt for target (bounded so an unconfirmed party is never asked indefinitely)
+    if _target_prompt_limit_reached(state):
+        return _close_target_unconfirmed(state)
     assistant_text = f"I'm trying to reach {target_name}. Is that you?"
     return _wrap_response(assistant_text, "request_target", [], state)
+
+
+def _target_prompt_limit_reached(state: CallState) -> bool:
+    """Count a pre-verification re-prompt; True once the limit of 2 has been used up."""
+    state.target_prompt_attempts += 1
+    return state.target_prompt_attempts > MAX_TARGET_PROMPT_ATTEMPTS
+
+
+def _close_target_unconfirmed(state: CallState) -> dict[str, Any]:
+    return _close_call(
+        state,
+        "I'm unable to confirm I've reached the right person, so I'll end this call. Goodbye.",
+        "target_unconfirmed",
+    )
 
 
 def _handle_verification(turn_event, state, party_profile, account_context, policy_config, transcript, nlu: IntentClassification):
@@ -234,8 +262,24 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
         state.escalation_reason = "dispute"
         return _escalate_and_end(state, policy_config, party_profile, account_context)
 
+    # Parse any payment date and dollar amount stated in this utterance up front, so a
+    # counter-offer is never mistaken for agreement with a pending proposal.
+    normalized = normalize_datetime_local(
+        transcript,
+        current_local_date=turn_event.current_local_date,
+        current_local_time=turn_event.current_local_time,
+        timezone=turn_event.timezone,
+    )
+    stated_date = normalized.get("date") if normalized.get("ok") else None
+    stated_partial = _resolve_stated_partial(transcript, amount, nlu)
+    pending_amount = state.last_proposed_payment_amount or amount
+
     # 2. Confirmation of a previously proposed payment date/amount.
-    if state.last_assistant_intent == "confirm_payment_date" and state.last_proposed_payment_date:
+    awaiting_confirmation = state.last_assistant_intent == "confirm_payment_date" and bool(state.last_proposed_payment_date)
+    is_counter_offer = (stated_date is not None and stated_date != state.last_proposed_payment_date) or (
+        stated_partial is not None and stated_partial != pending_amount
+    )
+    if awaiting_confirmation and not is_counter_offer:
         if nlu.matched("affirmation") and not nlu.matched("negation") and not nlu.matched("refusal"):
             status = _validate_ptp_date(state.last_proposed_payment_date, turn_event.current_local_date)
             if status == "valid":
@@ -256,7 +300,8 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
             return _wrap_response(assistant_text, "negotiate", [], state)
 
     # 3. Refusal must be checked before deliver_disclosure affirmation handling.
-    if nlu.matched("refusal"):
+    #    (A refusal that also offers a partial amount is handled as that offer below.)
+    if nlu.matched("refusal") and stated_partial is None:
         state.negotiation_proposals_count += 1
         if state.negotiation_proposals_count >= 2:
             state.escalation_reason = "hard_refusal"
@@ -267,34 +312,47 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
         )
         return _wrap_response(assistant_text, "negotiate", [], state)
 
-    # 4. Extract and validate proposed date before busy and deliver_disclosure affirmation handling.
-    normalized = normalize_datetime_local(
-        transcript,
-        current_local_date=turn_event.current_local_date,
-        current_local_time=turn_event.current_local_time,
-        timezone=turn_event.timezone,
-    )
-
-    if normalized.get("ok") and normalized.get("date"):
-        proposed_date = normalized["date"]
+    # 4. Validate a stated date before busy and deliver_disclosure affirmation handling.
+    if stated_date:
+        proposed_date = stated_date
+        proposed_amount = stated_partial or pending_amount
         date_status = _validate_ptp_date(proposed_date, turn_event.current_local_date)
-        if date_status == "in_past":
+        if date_status != "valid":
+            # Keep a stated partial amount pending so the next valid date is confirmed against it.
+            state.last_proposed_payment_date = None
+            if stated_partial is not None:
+                state.last_proposed_payment_amount = stated_partial
             last_day = _get_last_day_of_month_str(turn_event.current_local_date)
-            assistant_text = f"That date has already passed. What date between today and {last_day} works for you?"
-            return _wrap_response(assistant_text, "negotiate", [], state)
-        if date_status == "after_month_end":
-            last_day = _get_last_day_of_month_str(turn_event.current_local_date)
-            assistant_text = f"Our policy requires a commitment by the end of this month. What date between today and {last_day} works for you?"
+            if date_status == "in_past":
+                assistant_text = f"That date has already passed. What date between today and {last_day} works for you?"
+            else:
+                assistant_text = f"Our policy requires a commitment by the end of this month. What date between today and {last_day} works for you?"
             return _wrap_response(assistant_text, "negotiate", [], state)
 
-        if normalized.get("needs_confirmation"):
+        # A promise is recorded directly only for an unambiguous full-balance date. Anything
+        # negated, hedged, partial, or following a refusal is read back and needs an explicit yes.
+        needs_confirmation = (
+            bool(normalized.get("needs_confirmation"))
+            or nlu.matched("negation")
+            or nlu.matched("uncertain")
+            or proposed_amount != amount
+            or state.negotiation_proposals_count > 0
+        )
+        if needs_confirmation:
             state.last_proposed_payment_date = proposed_date
-            state.last_proposed_payment_amount = amount
+            state.last_proposed_payment_amount = proposed_amount
             friendly_date = _format_iso_date_for_voice(proposed_date)
-            assistant_text = f"Just to confirm, do you mean {friendly_date}?"
+            assistant_text = f"Just to confirm, a payment of ${proposed_amount} on {friendly_date}?"
             return _wrap_response(assistant_text, "confirm_payment_date", [], state)
 
         return _confirm_ptp(state, proposed_date, amount)
+
+    # 4b. A partial amount with no date: keep it pending and ask for the date.
+    if stated_partial is not None:
+        state.last_proposed_payment_date = None
+        state.last_proposed_payment_amount = stated_partial
+        assistant_text = f"Thank you. What date before the end of the month can you pay the ${stated_partial}?"
+        return _wrap_response(assistant_text, "negotiate", [], state)
 
     # 5. Direct yes/no response to the disclosure question ("Can you pay ... today?").
     if state.last_assistant_intent == "deliver_disclosure":
@@ -313,14 +371,15 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
         return _close_call(state, "I understand, we will try you again at a better time. Goodbye.", "busy")
 
     # 7. Response to any "can you pay/take care of this balance today?" style prompt.
+    #    The amount is whatever that prompt offered (a pending partial offer, else the balance).
     if _is_today_payment_prompt(last_q):
         if _looks_like_affirmative_today_response(transcript):
-            return _confirm_ptp(state, turn_event.current_local_date, amount)
+            return _confirm_ptp(state, turn_event.current_local_date, pending_amount)
         if nlu.matched("negation"):
             assistant_text = "I understand. What date before the end of the month would work for you?"
             return _wrap_response(assistant_text, "negotiate", [], state)
         if nlu.matched("affirmation") and not nlu.matched("negation") and not nlu.matched("refusal"):
-            return _confirm_ptp(state, turn_event.current_local_date, amount)
+            return _confirm_ptp(state, turn_event.current_local_date, pending_amount)
 
     # If we asked for an exact date and received only generic confirmation, ask
     # for a concrete date format instead of repeating the same prompt verbatim.
@@ -426,6 +485,71 @@ def _build_partial_offer(amount_due: str, current_local_date: str) -> tuple[str,
     last_day = _last_day_of_month(current_date)
     offer_date = min(current_date + timedelta(days=5), last_day)
     return f"{partial:.2f}", offer_date.isoformat()
+
+_AMOUNT_DIGITS_RE = re.compile(
+    r"\$\s*(\d[\d,]*(?:\.\d{1,2})?)|\b(\d[\d,]*(?:\.\d{1,2})?)\s*(?:dollars?|bucks?)\b",
+    re.I,
+)
+_AMOUNT_UNIT_RE = re.compile(r"\b(?:dollars?|bucks?)\b", re.I)
+_NUMBER_WORD_TOKENS = frozenset(
+    {
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+        "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+        "hundred", "thousand", "and",
+    }
+)
+
+
+def _extract_stated_amount(text: str) -> Decimal | None:
+    """Return a dollar amount the user explicitly stated ("$50", "50 dollars", "fifty bucks").
+
+    Only amounts carrying a currency marker are accepted, so day numbers and ZIP digits
+    are never read as money.
+    """
+    cleaned = (text or "").replace("’", "'").lower()
+    cents = Decimal("0.01")
+
+    match = _AMOUNT_DIGITS_RE.search(cleaned)
+    if match:
+        raw = (match.group(1) or match.group(2) or "").replace(",", "")
+        try:
+            return Decimal(raw).quantize(cents, rounding=ROUND_HALF_UP)
+        except InvalidOperation:
+            return None
+
+    unit = _AMOUNT_UNIT_RE.search(cleaned)
+    if unit:
+        number_words: list[str] = []
+        for token in reversed(re.findall(r"[a-z]+", cleaned[: unit.start()])):
+            if token not in _NUMBER_WORD_TOKENS:
+                break
+            number_words.append(token)
+        number_words.reverse()
+        while number_words and number_words[0] == "and":
+            number_words.pop(0)
+        value = _extract_number_from_words(" ".join(number_words)) if number_words else None
+        if value:
+            return Decimal(value).quantize(cents, rounding=ROUND_HALF_UP)
+
+    return None
+
+
+def _resolve_stated_partial(text: str, amount_due: str, nlu: IntentClassification) -> str | None:
+    """Return a user-stated partial amount ("50.00"), or None when no partial offer was made.
+
+    Amounts at or above the balance count as the full balance. An amount mentioned only
+    inside a refusal ("I can't afford even $50") is not an offer.
+    """
+    stated = _extract_stated_amount(text)
+    if stated is None or stated <= 0:
+        return None
+    if stated >= Decimal(amount_due):
+        return None
+    if nlu.matched("refusal") and not nlu.matched("affirmation"):
+        return None
+    return f"{stated:.2f}"
+
 
 def _get_last_day_of_month_str(current_iso):
     dt = datetime.fromisoformat(current_iso).date()
