@@ -6,7 +6,13 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from src.outbound_voice_agent import CallState, handle_turn, start_call
-from src.outbound_voice_agent.agent import TurnEvent, _enforce_voice_first, _extract_stated_amount
+from src.outbound_voice_agent.agent import (
+    TurnEvent,
+    _enforce_voice_first,
+    _extract_stated_amount,
+    _extract_zip,
+    _get_amount_due,
+)
 
 
 def default_context():
@@ -609,6 +615,92 @@ class OutboundAgentRegressions(unittest.TestCase):
                 self.assertEqual(self.call_state.phase, "ended")
                 self.assertEqual(self.call_state.end_reason, "target_unconfirmed")
                 self.assertNotIn("debt", third["assistant_text"].lower())
+
+    # --- Post-disclosure low-confidence, Decimal balance, strict ZIP & verification callback ---
+
+    def test_unmatched_utterances_after_disclosure_clarify_then_escalate(self):
+        ref_date = (2026, 2, 20)
+        for utterance in ("I lost my job", "quit calling this number"):
+            with self.subTest(utterance=utterance):
+                self.setUp()
+                self._verify(ref_date)
+
+                first = self.step(utterance, local_date=ref_date)
+                self.assertEqual(first["assistant_intent"], "negotiate")
+                self.assertNotIn("great", first["assistant_text"].lower())
+                self.assertIn("didn't catch", first["assistant_text"].lower())
+                self.assertEqual(self.call_state.clarification_attempts, 1)
+                self.assert_no_promise(first)
+
+                second = self.step(utterance, local_date=ref_date)
+                self.assertEqual(second["assistant_intent"], "escalate")
+                self.assertEqual(self.call_state.phase, "ended")
+                self.assertEqual(self.call_state.end_reason, "escalated_low_confidence")
+                self.assertTrue(self.call_state.escalation_flag)
+
+    def test_get_amount_due_uses_decimal_round_half_up(self):
+        self.assertEqual(_get_amount_due({"amount_due": "2.675"}), "2.68")
+
+    def test_extract_zip_strict_five_digits_and_zip_plus_4(self):
+        accepted = {
+            "78701": "78701",
+            "78701-1234": "78701",
+            "01234": "01234",
+            "it's 78 and 701": "78701",
+            "seven eight seven zero one": "78701",
+        }
+        for raw, expected in accepted.items():
+            with self.subTest(accepted=raw):
+                self.assertEqual(_extract_zip(raw), expected)
+
+        rejected = (
+            "787012",
+            "900001",
+            "787-010-2000",
+            "(787) 010-2000",
+            "seven eight seven zero one two",
+        )
+        for raw in rejected:
+            with self.subTest(rejected=raw):
+                self.assertIsNone(_extract_zip(raw))
+
+        # End-to-end via handle_turn(): phone number starting with 78701 fails, ZIP+4 succeeds.
+        self.step("This is Alex Morgan.")
+        phone_turn = self.step("787-010-2000")
+        self.assertEqual(self.call_state.phase, "verification")
+        self.assertFalse(self.call_state.right_party_verified)
+        self.assertEqual(phone_turn["assistant_intent"], "verify_identity")
+
+        zip_plus_4_turn = self.step("78701-1234")
+        self.assertEqual(self.call_state.phase, "post_verification")
+        self.assertTrue(self.call_state.right_party_verified)
+        self.assertEqual(zip_plus_4_turn["assistant_intent"], "deliver_disclosure")
+
+    def test_verification_callback_offer_accepted_closes_without_disclosure(self):
+        for reply in ("Yes", "Yes, call me back later"):
+            with self.subTest(reply=reply):
+                self.setUp()
+                self.step("This is Alex Morgan.")
+                prompt = self.step("why should I give you my zip code?")
+                self.assertEqual(prompt["assistant_intent"], "negotiate")
+                self.assertIn("call you back", prompt["assistant_text"].lower())
+
+                result = self.step(reply)
+                self.assertEqual(result["assistant_intent"], "close")
+                self.assertEqual(self.call_state.phase, "ended")
+                self.assertEqual(self.call_state.end_reason, "callback_requested")
+                self.assertTrue(self.call_state.callback.requested)
+                self.assertEqual(self.call_state.verification_attempts, 0)
+                self.assertFalse(self.call_state.right_party_verified)
+                self.assertNotIn("debt", result["assistant_text"].lower())
+                self.assertNotIn("240", result["assistant_text"].lower())
+                self.assertNotIn("northstar", result["assistant_text"].lower())
+                self.assertTrue(
+                    any(
+                        a.get("action") == "set_outcome" and a.get("outcome_code") == "callback_requested"
+                        for a in result["actions"]
+                    )
+                )
 
 
 if __name__ == "__main__":

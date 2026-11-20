@@ -71,6 +71,10 @@ export REGION="us-central1"
 >
 > **Production upgrade path:** Replace `JsonCallStore`, `JsonJobStore`, and `JsonContactAttemptStore` with Cloud SQL (PostgreSQL) and move outbound job leasing/retries to Cloud Tasks or Pub/Sub before scaling horizontally.
 
+> **Public Synthetic-Data Sandbox (`--allow-unauthenticated`)**
+>
+> Both services below use `--allow-unauthenticated` intentionally for a public, synthetic-data portfolio sandbox: Streamlit calls `collections-voice-api` server-side with plain `httpx` and no built-in auth middleware. Any production deployment handling real debtor data must deploy with `--no-allow-unauthenticated` and enforce IAM ID-token or OAuth2 authentication.
+
 ### Service 1: `collections-voice-api` (Required — Zero Paid API Keys)
 
 Deploy directly from source:
@@ -115,6 +119,7 @@ gcloud run deploy collections-voice-ui \
   --project "$PROJECT_ID" \
   --region "$REGION" \
   --allow-unauthenticated \
+  --session-affinity \
   --port 8080 \
   --memory 512Mi \
   --cpu 1 \
@@ -133,6 +138,7 @@ gcloud run deploy collections-voice-ui \
   --project "$PROJECT_ID" \
   --region "$REGION" \
   --allow-unauthenticated \
+  --session-affinity \
   --port 8080 \
   --memory 512Mi \
   --cpu 1 \
