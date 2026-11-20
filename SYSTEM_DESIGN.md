@@ -14,8 +14,8 @@ Right-party verification requires the caller to confirm their **5-digit ZIP code
 
 Wrong-party responses (`nlu.matched("wrong_party")`) are checked in both `_handle_pre_verification()` and `_handle_verification()` before discomfort or ZIP checks, closing cleanly as `wrong_party` without disclosure. In `pre_verification`, a plain `"no"` to "Is this them?" is also a wrong-party answer and closes the call instead of re-asking, while a conflicting yes/no (`"No, this is his wife"`) gets one clarification rather than being read as a yes. Other non-answers (identity questions, "I'm driving") are re-prompted at most twice (`target_prompt_attempts`) before the call ends as `target_unconfirmed`. Up to 3 failed ZIP attempts (`verification_attempts`) end the call with `verification_failed`.
 
-ZIP extraction in `_extract_zip()` supports common speech-to-text output formats:
-- Direct 5-digit strings: `"78701"`
+ZIP extraction in `_extract_zip()` requires an exact 5-digit match (rejecting 6-digit strings, phone numbers, or multi-ZIP inputs) while supporting common speech-to-text formats:
+- Direct 5-digit strings and ZIP+4: `"78701"`, `"01234"`, `"78701-1234"`
 - Split numeric forms: `"78 and 701"` → `"78701"`
 - Spoken digits: `"seven eight seven zero one"` → `"78701"`
 - Full number words: `"seventy eight thousand and seven hundred and one"` → `"78701"`
@@ -53,6 +53,7 @@ The boundary is **conversation handles flow; deterministic helpers handle date/a
 - 3 consecutive silences → `silence_timeout`
 - Global turn limit reached (default 25) → `max_turns`
 - Verification fails (3 attempts) or refused (after 2 reconduction prompts) → `verification_failed` / `verification_refused`
+- Caller accepts a callback offer during verification (without disclosing debt details) → `callback_requested` (sets `callback.requested = True`)
 - User is busy (with no payment date extracted) → `busy`
 
 **Calls escalate (`escalation_flag = True`, `phase = "ended"`) when:**
@@ -123,7 +124,7 @@ The core conversation and compliance engine intentionally uses **zero LLM calls*
 
 ## 10. Testing & CI Strategy
 
-- **99 unit & API tests (+ 35 subtests)** under `tests/` (`uv run pytest -v`), running offline in < 1 second with outbound non-UNIX sockets blocked and all vendor API keys cleared by `tests/conftest.py`:
+- **103 unit & API tests (+ 49 subtests)** under `tests/` (`uv run pytest -v`), running offline in < 1 second with outbound non-UNIX sockets blocked and all vendor API keys cleared by `tests/conftest.py`:
   - `test_intent_classifier.py`, `test_outbound_agent_regressions.py`, `test_compliance.py`, `test_contact_attempt_store.py`, `test_call_store.py`, `test_job_store.py`, `test_outbound_orchestration.py`, `test_server.py`, `test_voice_handler.py`, `test_call_metrics.py`, `test_nlu_report.py`.
 - **5 offline CLI scenario replays** (`scripts/run_outbound_demo.py --scenario ...`).
 - **3 in-process API smoke flows** (`scripts/smoke_api_demo.py --mode inprocess --temp-runtime`) and **worker compliance smoke test** (`scripts/smoke_worker_compliance.py`).

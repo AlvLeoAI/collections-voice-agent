@@ -197,6 +197,25 @@ def _handle_verification(turn_event, state, party_profile, account_context, poli
         state.target_reached = "no"
         return _close_call(state, "My apologies, I must have the wrong number. I'll update my records.", "wrong_party")
 
+    awaiting_callback_choice = (
+        state.last_assistant_intent == "negotiate"
+        and "call you back" in (state.last_assistant_question or "").lower()
+    )
+    if (
+        awaiting_callback_choice
+        and _extract_zip(transcript) is None
+        and (
+            nlu.matched("busy")
+            or (nlu.matched("affirmation") and not nlu.matched("negation"))
+        )
+    ):
+        state.callback.requested = True
+        return _close_call(
+            state,
+            "Understood, we'll call you back at another time. Goodbye.",
+            "callback_requested",
+        )
+
     # Check for discomfort or negation (refusal to verify)
     if nlu.matched("uncomfortable") or nlu.matched("negation"):
         state.reconduction_attempts += 1
@@ -405,11 +424,6 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
         )
         return _wrap_response(assistant_text, "confirm_payment_date", [], state)
 
-    # Initial negotiation prompt if just verified
-    if state.last_assistant_intent == "deliver_disclosure":
-        assistant_text = f"Great. Can you take care of the ${amount} balance today?"
-        return _wrap_response(assistant_text, "negotiate", [], state)
-
     if is_low_confidence_unknown(nlu):
         return _handle_low_confidence(
             state,
@@ -418,6 +432,16 @@ def _handle_negotiation(turn_event, state, party_profile, account_context, polic
             policy_config=policy_config,
             account_context=account_context,
         )
+
+    # Initial negotiation prompt if just verified
+    if (
+        state.last_assistant_intent == "deliver_disclosure"
+        and nlu.matched("affirmation")
+        and not nlu.matched("negation")
+        and not nlu.matched("refusal")
+    ):
+        assistant_text = f"Great. Can you take care of the ${amount} balance today?"
+        return _wrap_response(assistant_text, "negotiate", [], state)
 
     # Default negotiation fallback
     assistant_text = f"Can you find a day before the end of the month to settle this ${amount}?"
@@ -592,18 +616,25 @@ def _handle_low_confidence(
     state.escalation_reason = "low_confidence"
     return _escalate_and_end(state, policy_config, party_profile, account_context)
 
+_ZIP_PLUS_4_RE = re.compile(r"(?<!\d)(?<!-)(\d{5})-\d{4}(?!\d)(?!-)")
+
+
 def _extract_zip(text: str) -> str | None:
-    # Direct 5-digit ZIP.
-    match = re.search(r"\b(\d{5})\b", text)
-    if match:
-        return match.group(1)
-
-    # Handle split numeric forms like "78 and 701" -> "78701".
     numeric_digits = re.findall(r"\d", text)
-    if len(numeric_digits) >= 5:
-        return "".join(numeric_digits[:5])
 
-    # Handle spoken forms like "seven eight seven zero one".
+    # 1. ZIP+4 (e.g., "78701-1234"): exactly one match and exactly 9 digits total.
+    zip_plus_4_matches = _ZIP_PLUS_4_RE.findall(text)
+    if len(zip_plus_4_matches) == 1 and len(numeric_digits) == 9:
+        return zip_plus_4_matches[0]
+
+    # 2. Numeric digits: accept only exact 5 digits (direct or split like "78 and 701").
+    if numeric_digits:
+        if len(numeric_digits) == 5:
+            return "".join(numeric_digits)
+        if len(numeric_digits) > 5:
+            return None
+
+    # 3. Spoken digits (and mixed digit+word forms when numeric_digits < 5): exact 5 digits.
     spoken_digit_map = {
         "zero": "0",
         "oh": "0",
@@ -626,13 +657,14 @@ def _extract_zip(text: str) -> str | None:
         elif token.isdigit():
             spoken_digits.extend(list(token))
 
-    if len(spoken_digits) >= 5:
-        return "".join(spoken_digits[:5])
+    if len(spoken_digits) == 5:
+        return "".join(spoken_digits)
 
-    # Handle full number-word forms like "seventy eight thousand and seven hundred and one".
-    word_number = _extract_number_from_words(text)
-    if word_number is not None and 10000 <= word_number <= 99999:
-        return str(word_number)
+    # 4. Full number-word forms like "seventy eight thousand and seven hundred and one".
+    if not numeric_digits:
+        word_number = _extract_number_from_words(text)
+        if word_number is not None and 10000 <= word_number <= 99999:
+            return str(word_number)
 
     return None
 
@@ -734,7 +766,8 @@ def _extract_number_from_words(text: str) -> int | None:
 
 def _get_amount_due(context):
     val = context.get("amount_due", "0.00")
-    return f"{float(val):.2f}"
+    amount = Decimal(str(val).strip()).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{amount:.2f}"
 
 def _ask_verification_question(state, policy_config, *, user_text: str = ""):
     last_user_text = (user_text or "").lower()

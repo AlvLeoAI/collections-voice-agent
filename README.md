@@ -1,6 +1,6 @@
 # Outbound Collections Voice Agent
 
-A portfolio demonstration of **engineering judgment on when *not* to use an LLM** in a regulated consumer-finance domain (outbound collections). Deterministic Python controls every phase transition, right-party ZIP verification gate, payment-date bound (`today <= ptp_date <= end_of_month`), `Decimal`-based partial-offer calculation, and fail-closed pre-dial compliance check. Optional **Google Gemini 3.5 Transcribe** (`gemini-3.5-transcribe`, `store=False`) and **ElevenLabs** (`eleven_turbo_v2_5`) adapters are strictly lazy-loaded for voice I/O — the core agent, FastAPI backend, Streamlit text mode, CLI replays, and all 99 tests (+ 35 subtests) run completely offline with **zero API keys**.
+A portfolio demonstration of **engineering judgment on when *not* to use an LLM** in a regulated consumer-finance domain (outbound collections). Deterministic Python controls every phase transition, right-party ZIP verification gate, payment-date bound (`today <= ptp_date <= end_of_month`), `Decimal`-based partial-offer calculation, and fail-closed pre-dial compliance check. Optional **Google Gemini 3.5 Transcribe** (`gemini-3.5-transcribe`, `store=False`) and **ElevenLabs** (`eleven_turbo_v2_5`) adapters are strictly lazy-loaded for voice I/O — the core agent, FastAPI backend, Streamlit text mode, CLI replays, and all 103 tests (+ 49 subtests) run completely offline with **zero API keys**.
 
 **Repository**: https://github.com/AlvLeoAI/collections-voice-agent
 
@@ -18,7 +18,7 @@ A portfolio demonstration of **engineering judgment on when *not* to use an LLM*
 - **Outbound job orchestration** — Queue-based worker with cron/webhook/manual triggers, expired-lease reclamation (`JobEvent.LEASE_EXPIRED`), deterministic UTC-day or explicit `idempotency_key` deduplication, exponential backoff retries, and dead-letter handling
 - **PII-safe atomic persistence** — Atomic temp-file + `fsync` + `os.replace()` JSON writes (`storage_utils.py`), path-traversal ID validation (`validate_safe_id()`), unconditional `last_user_utterance = ""` redaction on disk (`_sanitize_call_state()`), and metadata-only voice logs
 - **Opt-in voice adapters** — Lazy-loaded Gemini 3.5 Transcribe STT (`store=False`, in-memory browser transcription) and ElevenLabs in-browser TTS (`st.audio()`) plus optional local CLI playback (`--voice`)
-- **Offline CI & test suite** — 99 tests (+ 35 subtests) running under `pytest` with outbound TCP/UDP sockets blocked by `tests/conftest.py`, `ruff` linting, and GitHub Actions CI
+- **Offline CI & test suite** — 103 tests (+ 49 subtests) running under `pytest` with outbound TCP/UDP sockets blocked by `tests/conftest.py`, `ruff` linting, and GitHub Actions CI
 
 ## Project Structure
 
@@ -176,7 +176,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for local Docker verification and Google Clou
 
 ## Test Suite
 
-- **99 tests (+ 35 subtests)** via `uv run pytest -v`, running in < 1 second with **zero API keys** and all outbound non-UNIX sockets blocked by `tests/conftest.py`.
+- **103 tests (+ 49 subtests)** via `uv run pytest -v`, running in < 1 second with **zero API keys** and all outbound non-UNIX sockets blocked by `tests/conftest.py`.
 - See [TESTING.md](TESTING.md) for the full verification checklist and [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for architecture and trade-offs.
 
 ## Honest Scope & Known Limitations
@@ -186,4 +186,4 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for local Docker verification and Google Clou
 3. **Pattern-based NLU coverage limits:** Regex rules trade semantic generalization for deterministic auditability. Unusual phrasing outside covered patterns relies on ambiguity checks and the 2-strike low-confidence escalation path. Stated amounts are recognized only with a currency marker (`$`, `dollars`, `bucks`), and `"today"` is handled as a yes/no answer rather than as a parsed date.
 4. **No real telephony or media streaming:** There is no SIP/PSTN/Twilio integration, real-time duplex WebRTC transport, or barge-in handling.
 5. **Opt-in external voice adapters vs. offline tests:** Live STT (`gemini-3.5-transcribe`) and TTS (`eleven_turbo_v2_5`) depend on external APIs when enabled; unit tests exercise those code paths using deterministic in-memory test doubles.
-6. **No API authentication middleware:** Demo REST endpoints assume a local sandbox or Cloud Run IAM / gateway perimeter rather than built-in bearer-token auth.
+6. **Public, unauthenticated synthetic-data sandbox:** The documented Cloud Run deployment uses `--allow-unauthenticated` because it is a public synthetic-data sandbox where Streamlit calls the FastAPI backend server-side with plain `httpx` and no built-in authentication middleware. Production deployments handling real debtor data must enforce IAM / ID-token (`--no-allow-unauthenticated`) or OAuth2 authentication.
