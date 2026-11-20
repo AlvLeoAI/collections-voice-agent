@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.venv
+.venv_runtime
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+tests/
+.env
+runtime/
+recordings/
+AGENTS.md
+CLAUDE.md
+docs/

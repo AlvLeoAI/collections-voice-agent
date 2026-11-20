@@ -1,122 +1,103 @@
 # Testing Guide
 
-## Core Outbound Verification
+All automated tests, linting, CLI scenarios, and smoke flows run **100% offline with zero API keys**.
 
-Run outbound scenario replays:
+## 1. Environment Sync, Lint & Unit/API Test Suite
 
 ```bash
-python3 scripts/run_outbound_demo.py --scenario scripts/scenarios/happy_path_ptp_end_of_month.json
-python3 scripts/run_outbound_demo.py --scenario scripts/scenarios/dispute_escalation.json
-python3 scripts/run_outbound_demo.py --scenario scripts/scenarios/wrong_party.json
-python3 scripts/run_outbound_demo.py --scenario scripts/scenarios/silence_callback.json
-python3 scripts/run_outbound_demo.py --scenario scripts/scenarios/date_too_late_reconduct.json
+uv sync --locked
+uv lock --check
+uv run ruff check .
+uv run pytest -v
 ```
 
-## Interactive Demo
+`tests/conftest.py` automatically clears all voice/AI API key environment variables and blocks outbound non-UNIX sockets during `pytest` runs.
+
+## 2. Offline CLI Scenario Replays
 
 ```bash
-python3 scripts/run_outbound_demo.py
+uv run python scripts/run_outbound_demo.py --scenario scripts/scenarios/happy_path_ptp_end_of_month.json
+uv run python scripts/run_outbound_demo.py --scenario scripts/scenarios/dispute_escalation.json
+uv run python scripts/run_outbound_demo.py --scenario scripts/scenarios/wrong_party.json
+uv run python scripts/run_outbound_demo.py --scenario scripts/scenarios/silence_callback.json
+uv run python scripts/run_outbound_demo.py --scenario scripts/scenarios/date_too_late_reconduct.json
+```
+
+## 3. Interactive CLI Demo
+
+Text-only offline mode (default):
+
+```bash
+uv run python scripts/run_outbound_demo.py
+```
+
+Optional ElevenLabs voice playback (requires `uv sync --locked --extra voice` and `ELEVENLABS_API_KEY`):
+
+```bash
+uv run python scripts/run_outbound_demo.py --voice
 ```
 
 - Press Enter on a blank line to simulate silence.
 - Type `quit` to exit.
 
-## API + Frontend Smoke Test
+## 4. In-Process API Smoke Flows (No Dirty `runtime/`)
+
+```bash
+uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario happy_path
+uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario dispute
+uv run python scripts/smoke_api_demo.py --mode inprocess --temp-runtime --scenario wrong_party
+```
+
+## 5. Worker Compliance Smoke Test
+
+```bash
+uv run python scripts/smoke_worker_compliance.py
+```
+
+Expected:
+- `PASS worker compliance smoke`
+- One allowed job initializes a call (`state=succeeded`, `outcome=call_initialized`).
+- One DNC job is canceled before dialing (`state=canceled`, `failure_reason=blocked_suppression_dnc`).
+
+## 6. Live API + Streamlit Sandbox Smoke Test
 
 In terminal 1:
 
 ```bash
-python3 src/api/server.py
+uv run uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 In terminal 2:
 
 ```bash
-streamlit run frontend/app.py
+uv run streamlit run frontend/app.py
 ```
 
-Then:
+Verify:
+- `curl -sf http://127.0.0.1:8000/health` returns `{"status":"ok","service":"collections-voice-agent","llm_in_core_path":false}`.
+- Initial outbound greeting appears in Streamlit with zero debt disclosure.
+- Text input advances turns and updates `call_state` in the sidebar (no API keys needed).
+- When `GEMINI_API_KEY` and/or `ELEVENLABS_API_KEY` are configured, sidebar **Voice Controls** unlock in-memory STT and in-browser TTS playback.
 
-- Confirm initial outbound greeting appears.
-- Confirm browser mic permission is allowed and the "Record your response" widget is visible.
-- Send a few user turns and verify `call_state` updates in the sidebar.
-- Verify actions are returned on close/escalation paths.
-
-## Queue Worker Smoke Test
-
-1. Start API:
+## 7. Local Docker Smoke Test (Zero API Keys)
 
 ```bash
-python3 src/api/server.py
-```
-
-2. Enqueue one job:
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/jobs/enqueue \
+docker build -t collections-voice-agent:local .
+docker run --rm --entrypoint whoami collections-voice-agent:local
+docker run --rm -d --name cva-smoke -p 18080:8080 collections-voice-agent:local
+sleep 2
+curl -sf http://127.0.0.1:18080/health
+curl -sf -X POST http://127.0.0.1:18080/call/start \
   -H "Content-Type: application/json" \
-  -d '{
-    "trigger_source":"manual",
-    "campaign_id":"cmp_demo",
-    "account_ref":"acct_demo_001",
-    "party_profile":{"target_name":"Alex Morgan","callback_number":"+1 (555) 010-2000"},
-    "account_context_ref":"ctx_demo_001",
-    "scheduled_for_utc":"2026-02-08T12:00:00+00:00"
-  }'
+  -d '{"party_profile":{"target_name":"Alex Morgan"}}'
+docker stop cva-smoke
 ```
 
-3. Run worker once:
+## Expected Core Behaviors
 
-```bash
-python3 scripts/run_outbound_worker.py --worker-id worker_local --once
-```
-
-4. Validate:
-- Job should be `succeeded` with outcome `call_initialized`.
-- A new file should exist under `runtime/calls/` with the initial outbound turn.
-
-## Compliance Gate Smoke Test
-
-Enqueue with DNC suppression:
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/jobs/enqueue \
-  -H "Content-Type: application/json" \
-  -d '{
-    "trigger_source":"manual",
-    "campaign_id":"cmp_demo",
-    "account_ref":"acct_demo_dnc",
-    "party_profile":{"target_name":"Alex Morgan","callback_number":"+1 (555) 010-2000"},
-    "account_context_ref":"ctx_demo_dnc",
-    "dnc": true
-  }'
-```
-
-Run worker once:
-
-```bash
-python3 scripts/run_outbound_worker.py --worker-id worker_local --once
-```
-
-Validate:
-- Job should be `canceled` with `failure_reason=blocked_suppression_dnc`.
-- `GET /attempts` should include a `decision_code=blocked_suppression_dnc` row.
-
-## One-command Worker Compliance Smoke
-
-```bash
-python3 scripts/smoke_worker_compliance.py
-```
-
-Expected:
-- `PASS worker compliance smoke`
-- One allowed job initializes a call.
-- One DNC job is canceled before dialing.
-
-## Expected Behaviors
-
-- No debt/company/account disclosure before successful right-party verification.
-- Wrong-party responses close with a non-sensitive outcome.
-- Dispute language triggers escalation action.
-- End-of-month policy rejects dates outside current month.
-- Silence eventually ends the call after limit handling.
+- No debt, balance, or creditor disclosure before right-party ZIP verification succeeds.
+- Wrong-party responses in `pre_verification` or `verification` close cleanly as `wrong_party` without disclosure.
+- Dispute language triggers immediate human escalation (`escalated_dispute`).
+- Past dates and post-month-end dates are rejected with reconduction to a valid current-month date.
+- In-call `"stop calling me"` persists `cease_contact=True` in the account suppression ledger, blocking future outbound dials even if a subsequent job has `cease_contact=False`.
+- Fail-closed pre-dial gate blocks invalid timezones, missing/malformed/inverted call windows, and invalid cap/gap configurations.
