@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta
-from typing import Optional, TypedDict
-
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 
 class NormalizedDateTimeResult(TypedDict, total=False):
     ok: bool
-    date: Optional[str]
-    time: Optional[str]
-    datetime_local: Optional[str]
+    date: str | None
+    time: str | None
+    datetime_local: str | None
     timezone: str
     confidence: float
     needs_confirmation: bool
-    notes: Optional[str]
+    notes: str | None
 
 
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
@@ -154,7 +153,19 @@ def normalize_datetime_local(
         except ValueError:
             pass
 
-    # 5) Weekdays (Spanish & English)
+    # 5) Next month / Mes que viene
+    if any(phrase in normalized_text for phrase in ["next month", "el mes que viene", "próximo mes", "proximo mes"]):
+        first_next_month = _last_day_of_month(current_date) + timedelta(days=1)
+        return _result(
+            first_next_month,
+            parsed_time,
+            timezone=timezone,
+            confidence=0.8,
+            needs_confirmation=True,
+            notes="next month",
+        )
+
+    # 6) Weekdays (Spanish & English)
     weekdays_map = {
         "lunes": 0, "monday": 0,
         "martes": 1, "tuesday": 1,
@@ -191,10 +202,13 @@ def _result(local_date: date, local_time, *, timezone: str, confidence: float, n
         datetime_local = None
         time_str = None
     else:
-        try: tzinfo = ZoneInfo(timezone)
-        except Exception: tzinfo = None
+        try:
+            tzinfo = ZoneInfo(timezone)
+        except Exception:
+            tzinfo = None
         dt = datetime.combine(local_date, local_time)
-        if tzinfo is not None: dt = dt.replace(tzinfo=tzinfo)
+        if tzinfo is not None:
+            dt = dt.replace(tzinfo=tzinfo)
         datetime_local = dt.isoformat()
         time_str = dt.strftime("%H:%M")
 
@@ -211,8 +225,10 @@ def _result(local_date: date, local_time, *, timezone: str, confidence: float, n
 
 
 def _last_day_of_month(d: date) -> date:
-    if d.month == 12: first_next = date(d.year + 1, 1, 1)
-    else: first_next = date(d.year, d.month + 1, 1)
+    if d.month == 12:
+        first_next = date(d.year + 1, 1, 1)
+    else:
+        first_next = date(d.year, d.month + 1, 1)
     return first_next - timedelta(days=1)
 
 

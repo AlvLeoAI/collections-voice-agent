@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
 
 Phase = Literal[
     "pre_verification",
@@ -25,9 +24,9 @@ class PromiseToPay(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Promise date in YYYY-MM-DD, if set.
-    date: Optional[str] = None
+    date: str | None = None
     # Decimal amount as a string (e.g., "50.00"), if set.
-    amount: Optional[str] = None
+    amount: str | None = None
     # True only when the user explicitly confirmed both date and amount.
     confirmed: bool = False
 
@@ -40,7 +39,7 @@ class Callback(BaseModel):
     # True if the user requested or accepted a callback.
     requested: bool = False
     # ISO-8601 local datetime string (confirmed with the user), if set.
-    datetime_local: Optional[str] = None
+    datetime_local: str | None = None
 
 
 class CallState(BaseModel):
@@ -73,7 +72,10 @@ class CallState(BaseModel):
     silence_count: int = 0
 
     # Most recent payment date proposed by the assistant (YYYY-MM-DD), if any.
-    last_proposed_payment_date: Optional[str] = None
+    last_proposed_payment_date: str | None = None
+
+    # Most recent payment amount proposed by the assistant (e.g., "40.00"), if any.
+    last_proposed_payment_amount: str | None = None
 
     # True when the call should be handed off or otherwise escalated ASAP.
     escalation_flag: bool = False
@@ -101,7 +103,7 @@ class CallState(BaseModel):
     # Count of consecutive low-confidence clarification prompts.
     clarification_attempts: int = 0
 
-    # Most recent finalized user transcript text (may be empty).
+    # Retained as empty string for backward schema compatibility; must not persist raw user transcripts.
     last_user_utterance: str = ""
 
     # Last assistant question asked (for loop prevention; may be empty).
@@ -135,7 +137,7 @@ class CallState(BaseModel):
     callback: Callback = Field(default_factory=Callback)
 
     # Escalation reason code or short label (set when escalation_flag is true).
-    escalation_reason: Optional[str] = None
+    escalation_reason: str | None = None
 
     # End reason code/label (set only when phase == "ended").
-    end_reason: Optional[str] = None
+    end_reason: str | None = None

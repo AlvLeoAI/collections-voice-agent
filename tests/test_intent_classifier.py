@@ -46,6 +46,36 @@ class IntentClassifierTests(unittest.TestCase):
         self.assertEqual(result.primary_intent, "unknown")
         self.assertTrue(is_low_confidence_unknown(result))
 
+    def test_cant_afford_is_refusal_not_affirmation(self):
+        for utterance in ("I can't afford it", "I can\u2019t afford it", "I can not pay"):
+            with self.subTest(utterance=utterance):
+                result = classify_utterance(utterance)
+                self.assertFalse(result.matched("affirmation"))
+        for utterance in ("I can't afford it", "I can\u2019t afford it"):
+            with self.subTest(refusal=utterance):
+                result = classify_utterance(utterance)
+                self.assertEqual(result.primary_intent, "refusal")
+                self.assertFalse(result.matched("affirmation"))
+
+    def test_wrong_person_is_wrong_party_not_human_handoff(self):
+        result = classify_utterance("You have the wrong person")
+        self.assertEqual(result.primary_intent, "wrong_party")
+        self.assertFalse(result.matched("human_handoff"))
+
+    def test_deferred_payment_date_not_classified_as_busy(self):
+        result = classify_utterance("I can pay later, on February 25")
+        self.assertFalse(result.matched("busy"))
+
+    def test_explicit_busy_call_me_later_matches_busy(self):
+        result = classify_utterance("I'm busy, call me later")
+        self.assertEqual(result.primary_intent, "busy")
+        self.assertTrue(result.matched("busy"))
+
+    def test_non_english_utterance_is_low_confidence_unknown(self):
+        result = classify_utterance("sí")
+        self.assertEqual(result.primary_intent, "unknown")
+        self.assertTrue(is_low_confidence_unknown(result))
+
 
 if __name__ == "__main__":
     unittest.main()
